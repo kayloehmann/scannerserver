@@ -38,9 +38,10 @@ Use a dedicated scan directory for the clean-setup pass. Do not copy an existing
 
 - Open `http://<host>:8080/` and confirm scanner setup appears without an existing config file.
 - Start discovery and confirm the iX500 appears with its expected name, IP, MAC address, and serial number.
-- Select the scanner. If it requires a password, enter the scanner password and confirm pairing succeeds.
-- Repeat setup with the manual IPv4-address/host-name and MAC form and confirm both the scanner's
-  IP and a resolvable name select the same scanner.
+- Select the scanner and confirm its serial-derived factory password completes pairing automatically.
+- Repeat setup with the manual IPv4-address/host-name and unified credential form. Confirm that both
+  the product serial number and a changed scanner password can complete setup.
+- Submit an incorrect value and confirm the browser retains the IP/host name and credential for correction.
 - Verify `/scans/.scannerserver-scanner.json` is created, remains owned by the configured container UID/GID, and contains no transient file beside it.
 - Clear setup and confirm scanning is blocked until the scanner is configured again.
 
@@ -60,13 +61,23 @@ credentials to the repository or ordinary test fixtures.
 ## Scan And OCR
 
 - Run a duplex PDF scan from the web UI and confirm exactly one scan job starts.
+- Load at least 25 duplex sheets, scan them as one job, and confirm the log reports continuation in
+  a new Wi-Fi transfer batch. Verify the resulting single PDF has the expected page count and passes
+  `qpdf --check`; no sheets may remain in the feeder after the job completes.
+- Confirm the terminal empty-feeder response ends that multi-batch job without opening another
+  transfer, leaving the scanner ready rather than blinking orange.
+- Scan more than 128 simplex sheets as one continuously reloaded job. Confirm the final PDF contains
+  every front in order, no backs, and no 128-page or 256-side cutoff.
 - Attempt a second scan while the first is running and confirm it is ignored without interrupting the active scan.
 - Verify source naming follows `YYYY-MM-DD.HHMMSS.pdf` and the file opens successfully.
 - Confirm the source PDF remains downloadable while blank removal, crop, and OCR run on a copy.
+- While blank removal or crop is still running, confirm the web scan control is enabled and the
+  physical button session has resumed. Start another scan and confirm it is acquired while the
+  first document remains queued or processing.
 - While `pdfimages` or OCR is actively consuming CPU, repeatedly refresh the index and verify HTTP
   responses remain immediate; background native-tool pipe reads and process waits must not starve
   the physical-button or HTTP actors.
-- With OCR enabled, wait for the serial OCR queue and verify the matching `.ocr.pdf` is searchable.
+- With OCR enabled, wait for the background queue and verify the matching `.ocr.pdf` is searchable.
 - Test simplex, single-page PDF, and PNG modes; verify page numbers use four digits.
 - Enable blank-page removal and crop with the existing fixture document and compare the result with a known-good legacy image.
 - Confirm creator metadata, previews, inline view, download, selected deletion, and preview-cache deletion.

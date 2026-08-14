@@ -158,7 +158,8 @@ struct ScannerServerApplicationTests {
                 #expect(body.contains("data-scanner-devices"))
                 #expect(body.contains("You can use manual setup at the same time."))
                 #expect(body.contains("Scanner IPv4 address or host name"))
-                #expect(body.contains("Host names are resolved to IPv4 during setup."))
+                #expect(body.contains("Scanner password or product serial number"))
+                #expect(body.contains("sessionStorage"))
                 #expect(!body.contains(#"name="scanner_security_key""#))
             }
             try await client.execute(uri: "/setup/scanners/state", method: .get) { response in
@@ -173,8 +174,8 @@ struct ScannerServerApplicationTests {
         }
     }
 
-    @Test("Scanner password input appears only after the default password fails")
-    func changedPasswordPrompt() async throws {
+    @Test("Manual scanner setup uses one unified credential field")
+    func unifiedManualCredentialForm() async throws {
         let fixture = try HTTPFixture(environment: ["SCAN_BACKEND": "wifi"])
         defer { fixture.remove() }
         let application = try fixture.application(scannerSetup: PasswordNeededSetupService())
@@ -182,11 +183,17 @@ struct ScannerServerApplicationTests {
         try await application.test(.router) { client in
             try await client.execute(uri: "/", method: .get) { response in
                 let body = String(buffer: response.body)
-                #expect(body.contains("action=\"/setup/scanners/password\""))
-                #expect(body.contains("type=\"text\" name=\"scanner_password\" autofocus"))
-                #expect(!body.contains("type=\"password\""))
-                #expect(body.contains(">Try password</button>"))
+                #expect(body.contains("action=\"/setup/scanners/manual\""))
+                #expect(body.contains("name=\"scanner_ip\""))
+                #expect(body.contains("name=\"scanner_credential\""))
+                #expect(body.contains("Scanner password or product serial number"))
+                #expect(body.contains("If you never changed the scanner password"))
+                #expect(!body.contains("name=\"scanner_serial\""))
+                #expect(!body.contains("name=\"scanner_mac\""))
+                #expect(!body.contains("name=\"scanner_password\""))
                 #expect(!body.contains("name=\"scanner_security_key\""))
+                #expect(body.contains("sessionStorage"))
+                #expect(body.contains("restoreSubmittedIPAddress"))
             }
         }
     }
@@ -266,6 +273,8 @@ struct ScannerServerApplicationTests {
                 "SCAN_RESOLUTION=600",
                 "SCAN_MODE=Gray",
                 "SCAN_LANGUAGE=eng",
+                "SCAN_OCR_CPU_LIMIT=4",
+                "SCAN_OCR_NICE=true",
                 "SCAN_CROP_MARGIN_POINTS=2.5",
                 "SCAN_OCR_ENABLED=on",
                 "SCAN_CROP_PAGES=on",
@@ -284,6 +293,8 @@ struct ScannerServerApplicationTests {
             #expect(mode.settings.format == "png")
             #expect(mode.settings.pageMode == "single")
             #expect(mode.settings.ocrEnabled)
+            #expect(mode.settings.ocrCPULimit == 4)
+            #expect(mode.settings.ocrNice)
             #expect(!mode.settings.removeBlankPages)
             #expect(mode.settings.cropPages)
             #expect(mode.settings.cropMarginPoints == 2.5)
@@ -298,6 +309,11 @@ struct ScannerServerApplicationTests {
                 #expect(body.contains(#"<option value="deu">German</option>"#))
                 #expect(body.contains(#"<option value="eng" selected>English</option>"#))
                 #expect(!body.contains(#"<input name="SCAN_LANGUAGE""#))
+                #expect(body.contains(#"<select name="SCAN_OCR_CPU_LIMIT">"#))
+                #expect(body.contains(#"<option value="4" selected>"#))
+                #expect(body.contains("Automatic uses the background CPU allowance while reserving one processor"))
+                #expect(body.contains(#"<select name="SCAN_OCR_NICE">"#))
+                #expect(body.contains(#"<option value="true" selected>Niced (reduced)</option>"#))
                 #expect(body.contains(#"name="SCAN_CROP_MARGIN_POINTS" value="2.5" min="0" step="0.1""#))
                 #expect(body.contains(#"class="mode-load-form""#))
                 #expect(body.contains(#"class="mode-editor-form""#))
@@ -367,8 +383,11 @@ struct ScannerServerApplicationTests {
                 #expect(!body.contains("action=\"/scan\""))
                 #expect(body.contains("action=\"/setup/scanners/discover\""))
                 #expect(body.contains("action=\"/setup/scanners/manual\""))
+                #expect(body.contains("name=\"scanner_credential\""))
+                #expect(!body.contains("name=\"scanner_mac\""))
+                #expect(!body.contains("name=\"scanner_serial\""))
                 #expect(!body.contains("name=\"scanner_security_key\""))
-                #expect(body.contains("security key cannot be derived from the Ethernet address"))
+                #expect(!body.contains("security key cannot be derived from the Ethernet address"))
                 #expect(body.contains("action=\"/setup/scanners/clear\""))
             }
         }
@@ -397,7 +416,7 @@ struct ScannerServerApplicationTests {
             }
             try await client.execute(uri: "/", method: .get) { response in
                 let body = String(buffer: response.body)
-                #expect(body.contains("Recent OCR jobs"))
+                #expect(body.contains("Recent processing jobs"))
                 #expect(body.contains("page-0001.pdf"))
                 #expect(body.contains("cancelled in "))
             }
@@ -447,13 +466,13 @@ struct ScannerServerApplicationTests {
             try await postForm(client, uri: "/setup/scanners/select", body: "device_id=") { response in
                 expectRedirect(response, to: "/?setup=no-device")
             }
-            try await postForm(client, uri: "/setup/scanners/manual", body: "scanner_ip=&scanner_mac=&scanner_serial=&scanner_security_key=") { response in
+            try await postForm(client, uri: "/setup/scanners/manual", body: "scanner_ip=&scanner_credential=") { response in
                 expectRedirect(response, to: "/?setup=manual-missing")
             }
-            try await postForm(client, uri: "/setup/scanners/manual", body: "scanner_ip=192.0.2.8&scanner_mac=&scanner_serial=ABC&scanner_security_key=secret") { response in
-                expectRedirect(response, to: "/?setup=unavailable")
+            try await postForm(client, uri: "/setup/scanners/manual", body: "scanner_ip=192.0.2.8&scanner_credential=") { response in
+                expectRedirect(response, to: "/?setup=manual-missing")
             }
-            try await postForm(client, uri: "/setup/scanners/password", body: "scanner_password=secret") { response in
+            try await postForm(client, uri: "/setup/scanners/manual", body: "scanner_ip=192.0.2.8&scanner_credential=secret") { response in
                 expectRedirect(response, to: "/?setup=unavailable")
             }
             try await postForm(client, uri: "/setup/scanners/clear", body: "") { response in
@@ -462,30 +481,26 @@ struct ScannerServerApplicationTests {
         }
     }
 
-    @Test("Legacy manual setup POST accepts an upfront security key")
-    func manualSetupSecurityKey() async throws {
+    @Test("Unified manual setup POST forwards the credential without exposing protocol keys")
+    func unifiedManualSetupCredential() async throws {
         let fixture = try HTTPFixture(environment: ["SCAN_BACKEND": "wifi"])
         defer { fixture.remove() }
         let scannerSetup = CapturingManualSetupService()
         let application = try fixture.application(scannerSetup: scannerSetup)
 
         try await application.test(.router) { client in
-            let form = [
-                "scanner_ip=192.0.2.8",
-                "scanner_mac=",
-                "scanner_serial=AWRHC08122",
-                "scanner_security_key=8122",
-            ].joined(separator: "&")
-            try await postForm(client, uri: "/setup/scanners/manual", body: form) { response in
+            try await postForm(
+                client,
+                uri: "/setup/scanners/manual",
+                body: "scanner_ip=office-scanner.example&scanner_credential=AWRHC08122"
+            ) { response in
                 expectRedirect(response, to: "/?setup=configured")
             }
         }
 
-        let request = try #require(await scannerSetup.manualRequests.first)
-        #expect(request.ipAddress == "192.0.2.8")
-        #expect(request.macAddress.isEmpty)
-        #expect(request.serial == "AWRHC08122")
-        #expect(await scannerSetup.securityKeys == ["8122"])
+        let request = try #require(await scannerSetup.unifiedRequests.first)
+        #expect(request.ipAddress == "office-scanner.example")
+        #expect(request.credential == "AWRHC08122")
     }
 
     @Test("File routes download, view, preview, reject traversal, and delete files")
@@ -645,13 +660,7 @@ private actor RunningDiscoverySetupService: ScannerSetupServing {
     func discover() -> ScannerSetupOutcome { .discoveryStarted }
     func select(deviceID: String) -> ScannerSetupOutcome { .unavailable }
 
-    func configureManually(
-        ipAddress: String,
-        macAddress: String,
-        serial: String
-    ) -> ScannerSetupOutcome { .unavailable }
-
-    func savePassword(_ password: String) -> ScannerSetupOutcome { .unavailable }
+    func configureManually(ipAddress: String, credential: String) -> ScannerSetupOutcome { .unavailable }
     func clear() -> ScannerSetupOutcome { .cleared }
 }
 
@@ -669,24 +678,17 @@ private actor PasswordNeededSetupService: ScannerSetupServing {
 
     func discover() -> ScannerSetupOutcome { .discoveryStarted }
     func select(deviceID: String) -> ScannerSetupOutcome { .unavailable }
-    func configureManually(
-        ipAddress: String,
-        macAddress: String,
-        serial: String
-    ) -> ScannerSetupOutcome { .unavailable }
-    func savePassword(_ password: String) -> ScannerSetupOutcome { .passwordFailed }
+    func configureManually(ipAddress: String, credential: String) -> ScannerSetupOutcome { .passwordFailed }
     func clear() -> ScannerSetupOutcome { .cleared }
 }
 
 private actor CapturingManualSetupService: ScannerSetupServing {
-    struct ManualRequest: Sendable {
+    struct UnifiedRequest: Sendable {
         let ipAddress: String
-        let macAddress: String
-        let serial: String
+        let credential: String
     }
 
-    private(set) var manualRequests: [ManualRequest] = []
-    private(set) var securityKeys: [String] = []
+    private(set) var unifiedRequests: [UnifiedRequest] = []
 
     func state() -> ScannerSetupState {
         ScannerSetupState(serviceAvailable: true)
@@ -695,21 +697,8 @@ private actor CapturingManualSetupService: ScannerSetupServing {
     func discover() -> ScannerSetupOutcome { .discoveryStarted }
     func select(deviceID: String) -> ScannerSetupOutcome { .unavailable }
 
-    func configureManually(
-        ipAddress: String,
-        macAddress: String,
-        serial: String
-    ) -> ScannerSetupOutcome {
-        manualRequests.append(ManualRequest(
-            ipAddress: ipAddress,
-            macAddress: macAddress,
-            serial: serial
-        ))
-        return .passwordNeeded
-    }
-
-    func savePassword(_ password: String) -> ScannerSetupOutcome {
-        securityKeys.append(password)
+    func configureManually(ipAddress: String, credential: String) -> ScannerSetupOutcome {
+        unifiedRequests.append(UnifiedRequest(ipAddress: ipAddress, credential: credential))
         return .configured
     }
 

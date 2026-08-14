@@ -134,13 +134,39 @@ public actor ScanJobActor {
             JLog.warning("Scan failed with status \(result.exitStatus): \(diagnostic)")
         }
 
+        if result.succeeded,
+           let deferredProcessing = result.deferredScanProcessing,
+           ocrQueue == nil
+        {
+            deferredProcessing.removeCleanupDirectoryIfValid()
+            jobState.status = "failed (70)"
+            jobState.error = "Background scan processing is unavailable."
+            worker = nil
+            await publish(.finished(succeeded: false))
+            await webUpdates.notify()
+            return
+        }
+
         if result.succeeded, let ocrQueue {
+            if let deferredProcessing = result.deferredScanProcessing {
+                await ocrQueue.enqueue(deferredProcessing)
+            }
             let preprocessMultipagePDF = configuration.format == "pdf"
                 && configuration.pageMode == "multi"
-            for path in paths where ScanOutputPaths.shouldEnqueueOCR(path: path, configuration: configuration) {
+            let batchID = UUID()
+            for path in paths {
+                let shouldOCR = ScanOutputPaths.shouldEnqueueOCR(
+                    path: path,
+                    configuration: configuration
+                )
+                let shouldPreprocess = preprocessMultipagePDF
+                    && (configuration.removeBlankPages || configuration.cropPages)
+                guard shouldOCR || shouldPreprocess else { continue }
                 await ocrQueue.enqueue(
                     path,
+                    batchID: batchID,
                     environment: configuration.environment,
+                    ocrEnabled: shouldOCR,
                     removeBlankPages: preprocessMultipagePDF && configuration.removeBlankPages,
                     cropPages: preprocessMultipagePDF && configuration.cropPages
                 )

@@ -62,7 +62,8 @@ struct ScanJobActorTests {
         let ocrQueue = OCRQueueActor(
             executor: executor,
             documentExecutor: executor,
-            workspaceSuffixProvider: { "test" }
+            workspaceSuffixProvider: { "test" },
+            configuration: OCRQueueConfiguration(cpuLimit: 1, niceLevel: nil)
         )
         let scanner = FakeNativeScanner(result: ProcessResult(
             exitStatus: 0,
@@ -89,6 +90,105 @@ struct ScanJobActorTests {
         #expect(!FileManager.default.fileExists(
             atPath: root.appendingPathComponent(".ocr-work.test").path
         ))
+    }
+
+    @Test("Non-OCR preprocessing continues after acquisition becomes idle")
+    func acquisitionPrecedesProcessingOnlyJob() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "scan-job-processing-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let source = root.appendingPathComponent("scan.pdf")
+        try Data("raw source".utf8).write(to: source)
+
+        let executor = FakeProcessExecutor(stubs: [
+            .suspended(ProcessResult(exitStatus: 0)),
+            .result(ProcessResult(exitStatus: 0)),
+        ])
+        let queue = OCRQueueActor(
+            executor: executor,
+            documentExecutor: executor,
+            workspaceSuffixProvider: { "processing-test" },
+            configuration: OCRQueueConfiguration(cpuLimit: 1, niceLevel: nil)
+        )
+        let scanner = FakeNativeScanner(result: ProcessResult(
+            exitStatus: 0,
+            standardOutput: "\(source.path)\n"
+        ))
+        let actor = ScanJobActor(nativeScanner: scanner, ocrQueue: queue)
+        let configuration = ScanPipelineConfiguration(environment: [
+            "SCAN_OCR_ENABLED": "false",
+            "SCAN_PAGE_MODE": "multi",
+            "SCAN_FORMAT": "pdf",
+            "SCAN_REMOVE_BLANK_PAGES": "true",
+            "SCAN_CROP_PAGES": "true",
+        ])
+
+        #expect(await actor.start(configuration: configuration))
+        await actor.waitUntilIdle()
+        await executor.waitForRequestCount(1)
+
+        #expect(await actor.state.status == "done")
+        #expect(await queue.state.status == "running")
+        #expect(await executor.requests().first?.executable == "remove-blank-pages")
+
+        await executor.resumeNextSuspendedExecution()
+        await queue.waitUntilIdle()
+        #expect(await executor.requests().map(\.executable) == [
+            "remove-blank-pages", "crop-pdf-pages",
+        ])
+    }
+
+    @Test("Single-page preprocessing continues after acquisition becomes idle")
+    func singlePageAcquisitionPrecedesProcessing() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "single-page-scan-job-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let output = root.appendingPathComponent("scans", isDirectory: true)
+
+        let executor = FakeProcessExecutor(stubs: [
+            .suspended(ProcessResult(exitStatus: 0)),
+        ])
+        let queue = OCRQueueActor(
+            executor: executor,
+            documentExecutor: executor,
+            workspaceSuffixProvider: { "single-page-processing" },
+            configuration: OCRQueueConfiguration(cpuLimit: 1, niceLevel: nil)
+        )
+        let pipeline = NativeScanPipeline(
+            executor: executor,
+            wifiAcquirer: FakeScanSnapWiFiAcquirer(),
+            timestampProvider: {
+                try! ScanTimestamp(rawValue: "2026-08-13.205338")
+            },
+            workDirectorySuffixProvider: { "single-page-processing" }
+        )
+        let actor = ScanJobActor(nativeScanner: pipeline, ocrQueue: queue)
+        let configuration = ScanPipelineConfiguration(environment: [
+            "SCAN_OUTPUT_DIR": output.path,
+            "SCAN_BACKEND": "wifi",
+            "SCANNER_IP": "192.0.2.20",
+            "SCAN_PAIRING_KEY": "pairing-key",
+            "SCAN_FORMAT": "pdf",
+            "SCAN_PAGE_MODE": "single",
+            "SCAN_OCR_ENABLED": "true",
+            "SCAN_REMOVE_BLANK_PAGES": "true",
+            "SCAN_CROP_PAGES": "true",
+        ])
+
+        #expect(await actor.start(configuration: configuration))
+        await executor.waitForRequestCount(1)
+
+        #expect(await actor.state.status == "done")
+        #expect(await queue.state.status == "running")
+        #expect(await executor.requests().first?.executable == "remove-blank-pages")
+
+        await actor.cancel()
+        await queue.cancelAll()
     }
 
     @Test("A nonzero scan exit records status, output, and error")

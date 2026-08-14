@@ -16,6 +16,8 @@ public struct ModeSettings: Codable, Equatable, Sendable {
         case format = "SCAN_FORMAT"
         case pageMode = "SCAN_PAGE_MODE"
         case ocrEnabled = "SCAN_OCR_ENABLED"
+        case ocrCPULimit = "SCAN_OCR_CPU_LIMIT"
+        case ocrNice = "SCAN_OCR_NICE"
         case removeBlankPages = "SCAN_REMOVE_BLANK_PAGES"
         case cropPages = "SCAN_CROP_PAGES"
         case cropMarginPoints = "SCAN_CROP_MARGIN_POINTS"
@@ -31,6 +33,8 @@ public struct ModeSettings: Codable, Equatable, Sendable {
     public var format: String
     public var pageMode: String
     public var ocrEnabled: Bool
+    public var ocrCPULimit: Int?
+    public var ocrNice: Bool
     public var removeBlankPages: Bool
     public var cropPages: Bool
     public var cropMarginPoints: Double
@@ -44,6 +48,8 @@ public struct ModeSettings: Codable, Equatable, Sendable {
         format: String = "pdf",
         pageMode: String = "multi",
         ocrEnabled: Bool = true,
+        ocrCPULimit: Int? = nil,
+        ocrNice: Bool = false,
         removeBlankPages: Bool = true,
         cropPages: Bool = true,
         cropMarginPoints: Double = 1.0
@@ -56,6 +62,8 @@ public struct ModeSettings: Codable, Equatable, Sendable {
         self.format = format
         self.pageMode = pageMode
         self.ocrEnabled = ocrEnabled
+        self.ocrCPULimit = Self.validOCRCPULimit(ocrCPULimit)
+        self.ocrNice = ocrNice
         self.removeBlankPages = removeBlankPages
         self.cropPages = cropPages
         self.cropMarginPoints = Self.validCropMarginPoints(
@@ -87,6 +95,15 @@ public struct ModeSettings: Codable, Equatable, Sendable {
             : defaults.validPageMode
 
         ocrEnabled = Self.isTruthy(values[EnvironmentKey.ocrEnabled.rawValue] ?? defaults.ocrEnabledText)
+        if let rawCPULimit = values[EnvironmentKey.ocrCPULimit.rawValue] {
+            let trimmed = rawCPULimit.trimmingCharacters(in: .whitespacesAndNewlines)
+            ocrCPULimit = trimmed.isEmpty
+                ? nil
+                : Self.validOCRCPULimit(Int(trimmed)) ?? defaults.ocrCPULimit
+        } else {
+            ocrCPULimit = defaults.ocrCPULimit
+        }
+        ocrNice = Self.isTruthy(values[EnvironmentKey.ocrNice.rawValue] ?? defaults.ocrNiceText)
         removeBlankPages = Self.isTruthy(
             values[EnvironmentKey.removeBlankPages.rawValue] ?? defaults.removeBlankPagesText
         )
@@ -129,6 +146,8 @@ public struct ModeSettings: Codable, Equatable, Sendable {
             EnvironmentKey.format.rawValue: format,
             EnvironmentKey.pageMode.rawValue: pageMode,
             EnvironmentKey.ocrEnabled.rawValue: ocrEnabledText,
+            EnvironmentKey.ocrCPULimit.rawValue: ocrCPULimitText,
+            EnvironmentKey.ocrNice.rawValue: ocrNiceText,
             EnvironmentKey.removeBlankPages.rawValue: removeBlankPagesText,
             EnvironmentKey.cropPages.rawValue: cropPagesText,
             EnvironmentKey.cropMarginPoints.rawValue: cropMarginPointsText,
@@ -141,6 +160,8 @@ public struct ModeSettings: Codable, Equatable, Sendable {
 
     public var simplexText: String { Self.booleanText(simplex) }
     public var ocrEnabledText: String { Self.booleanText(ocrEnabled) }
+    public var ocrCPULimitText: String { ocrCPULimit.map(String.init) ?? "" }
+    public var ocrNiceText: String { Self.booleanText(ocrNice) }
     public var removeBlankPagesText: String { Self.booleanText(removeBlankPages) }
     public var cropPagesText: String { Self.booleanText(cropPages) }
     public var cropMarginPointsText: String {
@@ -153,6 +174,11 @@ public struct ModeSettings: Codable, Equatable, Sendable {
 
     private static func validCropMarginPoints(_ value: Double?, fallback: Double) -> Double {
         guard let value, value.isFinite, value >= 0 else { return fallback }
+        return value
+    }
+
+    private static func validOCRCPULimit(_ value: Int?) -> Int? {
+        guard let value, value > 0 else { return nil }
         return value
     }
 
@@ -171,6 +197,9 @@ public struct ModeSettings: Codable, Equatable, Sendable {
             if let value = try container.compatibleStringIfPresent(forKey: key) {
                 values[key.rawValue] = value
             }
+        }
+        if values[EnvironmentKey.ocrCPULimit.rawValue] == nil {
+            values[EnvironmentKey.ocrCPULimit.rawValue] = ""
         }
         let defaults = (decoder.userInfo[SettingsCoding.environmentUserInfoKey] as? [String: String])
             .map(ModeSettings.init(environment:))
@@ -194,6 +223,8 @@ public struct ModeSettings: Codable, Equatable, Sendable {
         case format = "SCAN_FORMAT"
         case pageMode = "SCAN_PAGE_MODE"
         case ocrEnabled = "SCAN_OCR_ENABLED"
+        case ocrCPULimit = "SCAN_OCR_CPU_LIMIT"
+        case ocrNice = "SCAN_OCR_NICE"
         case removeBlankPages = "SCAN_REMOVE_BLANK_PAGES"
         case cropPages = "SCAN_CROP_PAGES"
         case cropMarginPoints = "SCAN_CROP_MARGIN_POINTS"

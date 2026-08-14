@@ -9,19 +9,22 @@ public actor NativeScanPipeline: NativeScanExecuting {
     public typealias WorkDirectorySuffixProvider = @Sendable () -> String
 
     private let executor: any ProcessExecutor
+    private let wifiAcquirer: any ScanSnapWiFiAcquiring
     private let acquisitionSessions: ScanSnapAcquisitionSessionCoordinator
     private let fileSystem: any NativeScanFileSystem
-    private let timestampProvider: TimestampProvider
+    private let timestampProvider: TimestampProvider?
     private let workDirectorySuffixProvider: WorkDirectorySuffixProvider
 
     public init(
         executor: any ProcessExecutor,
+        wifiAcquirer: any ScanSnapWiFiAcquiring = ScanSnapWiFiAcquisitionClient(),
         acquisitionSessions: ScanSnapAcquisitionSessionCoordinator = ScanSnapAcquisitionSessionCoordinator(),
         fileSystem: any NativeScanFileSystem = FoundationNativeScanFileSystem(),
-        timestampProvider: @escaping TimestampProvider = { ScanTimestamp(date: Date()) },
+        timestampProvider: TimestampProvider? = nil,
         workDirectorySuffixProvider: @escaping WorkDirectorySuffixProvider = { UUID().uuidString }
     ) {
         self.executor = executor
+        self.wifiAcquirer = wifiAcquirer
         self.acquisitionSessions = acquisitionSessions
         self.fileSystem = fileSystem
         self.timestampProvider = timestampProvider
@@ -56,7 +59,12 @@ public actor NativeScanPipeline: NativeScanExecuting {
         } catch {
             return failure(status: 1, message: "Could not create scan work directory: \(error.localizedDescription)")
         }
-        defer { try? fileSystem.removeItemIfPresent(at: workDirectory) }
+        var pipelineOwnsWorkDirectory = true
+        defer {
+            if pipelineOwnsWorkDirectory {
+                try? fileSystem.removeItemIfPresent(at: workDirectory)
+            }
+        }
 
         let capturingExecutor = NativeScanCapturingExecutor(executor: executor)
         do {
@@ -82,7 +90,6 @@ public actor NativeScanPipeline: NativeScanExecuting {
             }
 
             let options = try DocumentProcessingOptions(environment: environment)
-            let outputPaths: [String]
             if configuration.format == "pdf", configuration.pageMode == "multi" {
                 try await processForMultipagePDF(
                     rawPDF: rawPDF,
@@ -93,35 +100,36 @@ public actor NativeScanPipeline: NativeScanExecuting {
                     workDirectory: workDirectory,
                     executor: capturingExecutor
                 )
-                outputPaths = [outputDirectory
+                let outputPath = outputDirectory
                     .appendingPathComponent("\(timestamp.rawValue).pdf", isDirectory: false)
-                    .path]
-            } else {
-                outputPaths = try await processFinalOutputs(
-                    rawPDF: rawPDF,
-                    outputDirectory: outputDirectory,
-                    timestamp: timestamp,
-                    configuration: configuration,
-                    options: options,
-                    workDirectory: workDirectory,
-                    executor: capturingExecutor
+                    .path
+                guard fileSystem.regularFileExists(at: URL(fileURLWithPath: outputPath)) else {
+                    return await failure(
+                        status: 2,
+                        message: "No output files were created.",
+                        diagnosticsFrom: capturingExecutor
+                    )
+                }
+                return ProcessResult(
+                    exitStatus: 0,
+                    standardOutput: outputPath + "\n",
+                    standardError: await capturingExecutor.standardError
                 )
             }
 
-            guard !outputPaths.isEmpty,
-                  outputPaths.allSatisfy({ fileSystem.regularFileExists(at: URL(fileURLWithPath: $0)) })
-            else {
-                return await failure(
-                    status: 2,
-                    message: "No output files were created.",
-                    diagnosticsFrom: capturingExecutor
-                )
-            }
-
+            let deferredProcessing = deferredFinalOutputProcessing(
+                rawPDF: rawPDF,
+                outputDirectory: outputDirectory,
+                timestamp: timestamp,
+                configuration: configuration,
+                options: options,
+                workDirectory: workDirectory
+            )
+            pipelineOwnsWorkDirectory = false
             return ProcessResult(
                 exitStatus: 0,
-                standardOutput: outputPaths.joined(separator: "\n") + "\n",
-                standardError: await capturingExecutor.standardError
+                standardError: await capturingExecutor.standardError,
+                deferredScanProcessing: deferredProcessing
             )
         } catch is CancellationError {
             throw CancellationError()
@@ -229,33 +237,49 @@ public actor NativeScanPipeline: NativeScanExecuting {
                 )
             }
 
-            var arguments = ["-s", scannerIP, "-k", pairingKey, "-o", rawPDF.path]
-            if acquisitionSessionMode == .reuseArmed {
-                arguments.append("--reuse-session")
+            let clientIPAddress: String?
+            if let configured = nonEmpty(environment["SCANSNAP_CLIENT_IP"]) {
+                do {
+                    clientIPAddress = try ScannerConfig.normalizeIPv4Address(configured)
+                } catch {
+                    throw NativeScanConfigurationError.message(
+                        "Invalid SCANSNAP_CLIENT_IP: \(configured)"
+                    )
+                }
+            } else {
+                clientIPAddress = nil
             }
-            if let clientIP = nonEmpty(environment["SCANSNAP_CLIENT_IP"]) {
-                arguments += ["--client-ip", clientIP]
+            let clientMACAddress: [UInt8]?
+            if let configured = nonEmpty(environment["SCANSNAP_CLIENT_MAC"]) {
+                do {
+                    clientMACAddress = try ScanSnapSetupEnvironmentConfiguration.macBytes(configured)
+                } catch {
+                    throw NativeScanConfigurationError.message(
+                        "Invalid SCANSNAP_CLIENT_MAC: \(configured)"
+                    )
+                }
+            } else {
+                clientMACAddress = nil
             }
-            if let clientMAC = nonEmpty(environment["SCANSNAP_CLIENT_MAC"]) {
-                arguments += ["--client-mac", clientMAC]
-            }
-            if configuration.simplex
+            let simplex = configuration.simplex
                 || configuration.source.contains("Simplex")
                 || configuration.source.contains("simplex")
-            {
-                arguments.append("-1")
-            }
-            if environment["SCAN_WIFI_DEBUG"] == "true" {
-                arguments.append("-d")
-            }
-
-            let result = try await executor.execute(ProcessRequest(
-                executable: "scansnap-wifi",
-                arguments: arguments,
-                environment: environment,
-                workingDirectory: workDirectory
+            let buttonConfiguration = ScanSnapButtonConfiguration(environment: environment)
+            let result = try await wifiAcquirer.acquire(ScanSnapWiFiAcquisitionRequest(
+                scannerIPAddress: scannerIP,
+                identity: ScanSnapIdentity(pairingKey),
+                clientIPAddress: clientIPAddress,
+                clientMACAddress: clientMACAddress,
+                clientInterface: nonEmpty(environment["SCANSNAP_CLIENT_INTERFACE"]) ?? "eth0",
+                simplex: simplex,
+                reusesArmedSession: acquisitionSessionMode == .reuseArmed,
+                debug: environment["SCAN_WIFI_DEBUG"] == "true",
+                outputURL: rawPDF,
+                registrationSourcePort: buttonConfiguration.registrationSourcePort,
+                registrationPort: buttonConfiguration.registrationPort
             ))
-            return result.succeeded ? nil : result
+            await executor.recordDiagnostic(result.diagnostics)
+            return nil
 
         case let backend:
             throw NativeScanConfigurationError.message("Unsupported SCAN_BACKEND: \(backend)")
@@ -271,24 +295,6 @@ public actor NativeScanPipeline: NativeScanExecuting {
         workDirectory: URL,
         executor: NativeScanCapturingExecutor
     ) async throws {
-        if configuration.removeBlankPages && !configuration.ocrEnabled {
-            try await executeDocumentStep(
-                .removeBlankPages,
-                command: options.removeBlankPagesRequest(pdfPath: rawPDF.path).command,
-                environment: configuration.environment,
-                workingDirectory: workDirectory,
-                executor: executor
-            )
-        }
-        if configuration.cropPages && !configuration.ocrEnabled {
-            try await executeDocumentStep(
-                .cropPages,
-                command: options.cropPagesRequest(pdfPath: rawPDF.path).command,
-                environment: configuration.environment,
-                workingDirectory: workDirectory,
-                executor: executor
-            )
-        }
         try await executeDocumentStep(
             .setCreatorMetadata,
             command: SetPDFCreatorRequest(pdfPath: rawPDF.path, creator: options.creator).command,
@@ -308,15 +314,14 @@ public actor NativeScanPipeline: NativeScanExecuting {
         try fileSystem.placeFileExclusively(at: rawPDF, destination: destination)
     }
 
-    private func processFinalOutputs(
+    private func deferredFinalOutputProcessing(
         rawPDF: URL,
         outputDirectory: URL,
         timestamp: ScanTimestamp,
         configuration: ScanPipelineConfiguration,
         options: DocumentProcessingOptions,
-        workDirectory: URL,
-        executor: NativeScanCapturingExecutor
-    ) async throws -> [String] {
+        workDirectory: URL
+    ) -> DeferredScanProcessing {
         let finalOutput: DocumentFinalOutputRequest
         if configuration.format == "png" {
             finalOutput = .exportImages(ExportScanImagesRequest(
@@ -344,9 +349,12 @@ public actor NativeScanPipeline: NativeScanExecuting {
             environment: configuration.environment,
             workingDirectory: workDirectory
         )
-        return try await DocumentProcessingOrchestrator(executor: executor)
-            .process(plan)
-            .outputPaths
+        return DeferredScanProcessing(
+            inputPath: rawPDF.path,
+            cleanupDirectory: workDirectory,
+            plan: plan,
+            ocrEnabled: configuration.ocrEnabled && configuration.format == "pdf"
+        )
     }
 
     private func executeDocumentStep(
@@ -372,7 +380,10 @@ public actor NativeScanPipeline: NativeScanExecuting {
 
     private func scanTimestamp(environment: [String: String]) throws -> ScanTimestamp {
         guard let configuredTimestamp = nonEmpty(environment["SCAN_TIMESTAMP"]) else {
-            return timestampProvider()
+            if let timestampProvider {
+                return timestampProvider()
+            }
+            return ScannerServerLocalTime(environment: environment).scanTimestamp(for: Date())
         }
         do {
             return try ScanTimestamp(rawValue: configuredTimestamp)
@@ -564,5 +575,10 @@ private actor NativeScanCapturingExecutor: ProcessExecutor {
             diagnostics.append("\(request.executable): \(error)")
         }
         return result
+    }
+
+    func recordDiagnostic(_ message: String) {
+        let detail = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !detail.isEmpty { diagnostics.append("ScanSnap: \(detail)") }
     }
 }

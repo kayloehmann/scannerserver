@@ -5,23 +5,32 @@ public enum ScanPipelineCommands {
         inputPath: String,
         outputPath: String? = nil,
         environment: [String: String]? = nil,
-        workingDirectory: URL? = nil
+        workingDirectory: URL? = nil,
+        jobs: Int? = nil,
+        niceLevel: Int? = nil
     ) -> ProcessRequest {
         let language = environment?["SCAN_LANGUAGE"] ?? "deu+eng"
         let rotatePagesThreshold = environment?["SCAN_OCR_ROTATE_PAGES_THRESHOLD"] ?? "2.0"
+        var arguments = [
+            "--language", language,
+            "--rotate-pages",
+            "--rotate-pages-threshold", rotatePagesThreshold,
+            "--deskew",
+            "--optimize", "1",
+        ]
+        if let jobs {
+            arguments += ["--jobs", String(max(1, jobs))]
+        }
+        arguments += [
+            inputPath,
+            outputPath ?? OCRInputPath.outputPath(for: inputPath) ?? inputPath,
+        ]
         return ProcessRequest(
             executable: "ocrmypdf",
-            arguments: [
-                "--language", language,
-                "--rotate-pages",
-                "--rotate-pages-threshold", rotatePagesThreshold,
-                "--deskew",
-                "--optimize", "1",
-                inputPath,
-                outputPath ?? OCRInputPath.outputPath(for: inputPath) ?? inputPath,
-            ],
+            arguments: arguments,
             environment: environment,
-            workingDirectory: workingDirectory
+            workingDirectory: workingDirectory,
+            niceLevel: niceLevel
         )
     }
 

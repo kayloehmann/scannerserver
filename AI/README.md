@@ -4,7 +4,7 @@ description: Routing index for the Swift service architecture, compatibility con
 type: index
 audience: agents and maintainers
 status: current
-last_updated: 2026-07-22
+last_updated: 2026-08-12
 ---
 
 # Agent documentation
@@ -16,17 +16,30 @@ Use [docs/index.md](../docs/index.md) as the authoritative documentation map. Th
 | Topic | Read first |
 | --- | --- |
 | Operator setup and first scan | [README.md](../README.md) |
+| Current architecture, package boundaries, compatibility, and validation | [docs/architecture.md](../docs/architecture.md) |
 | Environment variables, filenames, modes, and post-processing | [docs/configuration.md](../docs/configuration.md) |
 | Images, host networking, Compose, builds, and publishing | [docs/deployment.md](../docs/deployment.md) |
 | ScanSnap iX500 discovery, pairing, transport, and button behavior | [docs/protocol.md](../docs/protocol.md) |
 | Real-hardware acceptance | [docs/swift-hardware-validation.md](../docs/swift-hardware-validation.md) |
-| Architecture, migration decisions, compatibility, and test strategy | [docs/swift-migration-plan.md](../docs/swift-migration-plan.md) |
+| Completed Python-to-Swift migration evidence | [docs/history/swift-migration.md](../docs/history/swift-migration.md) |
+
+## Current State And Scope
+
+The Python-to-Swift service migration is complete. Read the current architecture document before
+broad implementation changes. The historical migration record contains completed task lists and
+must not be interpreted as work still to perform.
+
+If a request's premise conflicts with the current tree, verify recent history and report the
+mismatch before changing code. An unqualified cleanup is behavior-preserving and does not authorize
+runtime redesign, public-API contraction, protocol changes, or replacement of working subsystems.
 
 ## Project shape
 
 `scannerserver` is a Swift 6.3, Linux-first service packaged with SwiftPM and deployed as a multi-stage container image. `Sources/scannerserver` is the thin ArgumentParser entry point. `Sources/ScannerServerCore` owns the HTTP application, settings, document and preview operations, scan/OCR pipeline, ScanSnap networking, and long-lived runtime actors. Swift Testing coverage lives under `tests/ScannerServerCoreTests`.
 
-The runtime invokes native tools for scanner acquisition, OCR, PDF processing, image conversion, metadata, and SANE compatibility. Treat command availability and the SwiftPM resource bundle as part of the container contract.
+The runtime implements ScanSnap acquisition and raw PDF assembly in Swift. It invokes native tools
+for OCR, later PDF/image processing, metadata, and optional SANE compatibility. Treat those command
+dependencies and the SwiftPM resource bundle as part of the container contract.
 
 ## Compatibility boundaries
 

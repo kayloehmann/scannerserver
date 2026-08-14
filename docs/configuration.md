@@ -10,15 +10,26 @@ status: current
 
 ## Output Files
 
-PDF scans produce a source PDF immediately and an OCR PDF later if OCR is enabled:
+Multipage PDF scans produce a source PDF immediately and an OCR PDF later if OCR is enabled:
 
 ```text
 YYYY-MM-DD.HHMMSS.pdf
 YYYY-MM-DD.HHMMSS.ocr.pdf
 ```
 
-Deleting a source scan while OCR is active cancels that document's OCR process before removing
-the file. Matching queued OCR work is removed as well, while OCR jobs for other scans continue.
+The date and time prefix uses the service's `TZ` setting, including daylight-saving changes. The
+web status timestamps and file-list day headings use the same time zone.
+
+For multipage PDF mode, the acquisition lifecycle finishes as soon as the source PDF is published.
+For single-page PDF and PNG modes, it finishes after the captured raw document is handed to the
+background queue; blank removal and crop still run across the complete document before the queue
+publishes individual files. The web scan control and physical button can therefore accept another
+scan while blank-page removal, crop, final-output conversion, or OCR is still running. Without OCR,
+the background queue processes an isolated multipage copy and atomically replaces the source PDF.
+With OCR, it leaves the source unchanged and publishes the processed `.ocr.pdf`.
+
+Deleting a source scan while processing is active cancels that document's work before removing the
+file. Matching queued work is removed as well, while jobs for other scans continue.
 
 Single-page PDF modes use:
 
@@ -26,6 +37,10 @@ Single-page PDF modes use:
 YYYY-MM-DD.HHMMSS-page-0001.pdf
 YYYY-MM-DD.HHMMSS-page-0001.ocr.pdf
 ```
+
+These individual files appear after background blank removal, crop, metadata, and splitting finish.
+OCR variants then appear beside them as their queued jobs complete. PNG exports follow the same
+deferred final-output lifecycle.
 
 PNG modes save one image per page:
 
@@ -46,13 +61,15 @@ On first start, the web UI creates `/scans/.scanner-settings.json` with default 
 
 Use **Advanced settings** in the web UI to add, edit, delete, or choose the mode used by the physical scanner button.
 
-With the ScanSnap Wi-Fi backend, modes control simplex/duplex, output conversion, OCR, blank-page removal, autocrop, and the extra margin kept around cropped content. The reverse-engineered Wi-Fi scanner command does not expose resolution or color controls. `SCAN_RESOLUTION`, `SCAN_MODE`, and `SCAN_SOURCE` are mainly for the SANE fallback backend. The web UI shows a short explanation beneath every mode setting.
+With the ScanSnap Wi-Fi backend, modes control simplex/duplex, output conversion, OCR, the background CPU limit and post-scan process priority, blank-page removal, autocrop, and the extra margin kept around cropped content. The OCR card offers a **Processing CPUs** dropdown: **Automatic** uses the container-aware background allowance, while a number lowers the limit for that mode. **Post-scan priority** selects normal or reduced (`nice`) priority for every external tool launched by background processing. The reverse-engineered Wi-Fi scanner command does not expose resolution or color controls. `SCAN_RESOLUTION`, `SCAN_MODE`, and `SCAN_SOURCE` are mainly for the SANE fallback backend. The web UI shows a short explanation beneath every mode setting.
 
 ## Common Environment Variables
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `TZ` | `Europe/Berlin` | Local IANA time zone used for scan filenames, file grouping, and status timestamps |
 | `SCAN_OUTPUT_DIR` | `/scans` | Output directory inside the container |
+| `TMPDIR` | `<SCAN_OUTPUT_DIR>/.ocr-tmp` | Writable temporary directory created at startup and used by OCRmyPDF, Ghostscript, Tesseract, and other document tools |
 | `SCAN_SETTINGS_PATH` | `/scans/.scanner-settings.json` | Saved scan modes and button-default mode |
 | `SCANNER_CONFIG_PATH` | `/scans/.scannerserver-scanner.json` | Saved Wi-Fi scanner IP and derived pairing identity |
 | `SCAN_BACKEND` | `wifi` | `wifi` for iX500 Wi-Fi protocol, `sane` for SANE fallback |
@@ -60,7 +77,10 @@ With the ScanSnap Wi-Fi backend, modes control simplex/duplex, output conversion
 | `SCAN_FORMAT` | `pdf` | `pdf` or `png` |
 | `SCAN_PAGE_MODE` | `multi` | `multi` for one multipage PDF, `single` for one PDF per page |
 | `SCAN_OCR_ENABLED` | `true` | Queue OCR for PDF output after scanning |
-| `SCAN_CROP_PAGES` | `true` | Crop PDF pages to the detected paper or content bounds before OCR |
+| `SCAN_OCR_CPU_LIMIT` | detected CPUs minus one | Optional positive cap on CPUs used by background page processing and OCR; values above the background allowance are clamped |
+| `SCAN_OCR_NICE` | `false` | Run post-scan document-processing subprocesses with reduced CPU scheduling priority |
+| `SCAN_OCR_NICE_LEVEL` | `10` | Nice increment from `1` through `19` when `SCAN_OCR_NICE` is enabled |
+| `SCAN_CROP_PAGES` | `true` | Crop PDF pages to the detected paper or content bounds in background processing |
 | `SCAN_CROP_MARGIN_POINTS` | `1` | Extra margin around content-classified autocrops, in PDF points (1 point = 1/72 inch) |
 | `SCANNER_IP` | empty | Optional scanner IP override; web setup can persist this instead |
 | `SCANSNAP_PAIRING_KEY` | empty | Optional pairing identity override; web setup can derive and persist this instead |
@@ -89,6 +109,45 @@ With the ScanSnap Wi-Fi backend, modes control simplex/duplex, output conversion
 
 `SCANSNAP_BUTTON_REGISTRATION_INTERVAL_SECONDS` remains accepted as a compatibility alias for
 `SCANSNAP_BUTTON_ARM_INTERVAL_SECONDS` when the current variable is absent.
+
+## Background Processing CPU Scheduling And Priority
+
+Background page processing and OCR automatically use the CPU allowance visible to the service. The detector considers the
+process's active processor count plus Linux cgroup CPU quota and cpuset restrictions, so Docker
+CPU limits are honored. One detected processor is reserved for acquisition, button handling, and
+HTTP work (a one-CPU container still gets one worker). `SCAN_OCR_CPU_LIMIT` can lower the remaining
+allowance but cannot raise it. It can be configured globally in the container environment or per
+scan mode with the web UI. A mode set to **Automatic** inherits this container-aware allowance.
+
+The queue treats the resulting value as one shared CPU budget:
+
+- Multipage blank detection and crop analysis process several pages concurrently, bounded by the
+  shared budget; operations within each page remain ordered.
+
+- A multipage PDF reserves the full budget and passes it to OCRmyPDF with `--jobs` so its pages
+  are processed in parallel.
+- Single-page PDF mode starts one OCRmyPDF process per page, up to the budget, and gives each
+  process `--jobs 1`.
+- Multipage and single-page work do not oversubscribe each other. FIFO ordering is preserved when
+  the next document needs more CPU slots than are currently free.
+
+Post-scan processing runs at normal process priority by default so a busy service host cannot starve
+background work. Reduced-priority mode remains available as an explicit opt-in, globally through
+the environment or per scan mode through **Post-scan priority** in the web UI. When enabled, the
+nice level applies to every external tool launched after scanner acquisition releases its foreground
+lifecycle, including blank removal, autocrop, final output conversion, metadata updates, and OCR.
+The scannerserver process and scanner acquisition remain at normal priority. The global nice level
+controls the increment used by niced modes. To use at most four CPUs and a nice level of `+15`:
+
+```yaml
+environment:
+  SCAN_OCR_CPU_LIMIT: "4"
+  SCAN_OCR_NICE: "true"
+  SCAN_OCR_NICE_LEVEL: "15"
+```
+
+The status page reports the active CPU budget, process priority, running background job count, and
+queued job count.
 
 ## Scan Directory Access Check
 
@@ -243,5 +302,5 @@ Expected recovery behavior:
 `scanner rejected registration (error -7)` immediately after a button notice means the scanner
 still considers a session owner active. If `ScanSnap button client armed` appeared first, the scan
 must reuse that armed session; a second UDP registration is a protocol error, not a recovery step.
-Confirm the image includes session handoff support and that `scansnap-wifi` is launched with
-`--reuse-session`. Also confirm the lifecycle and native client derive the same client IP and MAC.
+Confirm the image includes native session handoff support and that the lifecycle and Swift
+acquisition client derive the same client IP and MAC.

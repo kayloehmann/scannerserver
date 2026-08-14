@@ -22,7 +22,8 @@ struct RuntimeOCRCompositionTests {
         let scanState = await dependencies.scanJobs.state
         let ocrState = await dependencies.ocrQueue.state
         #expect(scanState.status == "done")
-        #expect(scanState.output == fixture.inputURL.path)
+        // Final single-page paths are published by the background queue after acquisition finishes.
+        #expect(scanState.output.isEmpty)
         #expect(ocrState.status == "done")
         #expect(ocrState.input == fixture.inputURL.path)
         #expect(ocrState.output == fixture.outputURL.path)
@@ -43,7 +44,10 @@ struct RuntimeOCRCompositionTests {
                 standardError: "<ocr-error>&\n"
             )),
         ])
-        let ocrQueue = OCRQueueActor(executor: executor)
+        let ocrQueue = OCRQueueActor(
+            executor: executor,
+            configuration: OCRQueueConfiguration(cpuLimit: 3, niceLevel: 10)
+        )
         let dependencies = fixture.dependencies(ocrQueue: ocrQueue)
         let application = try ScannerServerApplication.make(
             configuration: try ScannerServerServiceConfiguration(hostname: "127.0.0.1", port: 8080),
@@ -58,8 +62,9 @@ struct RuntimeOCRCompositionTests {
             try await client.execute(uri: "/", method: .get) { response in
                 let body = String(buffer: response.body)
                 #expect(response.status == .ok)
-                #expect(body.contains("<h2>OCR</h2>"))
+                #expect(body.contains("<h2>Background processing</h2>"))
                 #expect(body.contains("<span class=\"status\">running</span> 1 queued"))
+                #expect(body.contains("CPU budget: 3; priority: nice +10"))
                 #expect(body.contains("Input: /scans/&lt;first&gt;&amp;.pdf"))
                 #expect(!body.contains(firstInput))
             }

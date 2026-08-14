@@ -4,7 +4,10 @@
 
 It runs on a Raspberry Pi or other Linux host, finds the iX500 on your local network, and lets you scan from a web page or by pressing the scanner's physical button. Scans are written to a host directory as PDFs, with OCR running in the background.
 
-The service is implemented as a Swift 6.3 package. Its long-running process is native Swift; OCRmyPDF, Tesseract, qpdf, Poppler, libvips, ExifTool, SANE, and the ScanSnap acquisition utility remain external command-line tools invoked only for scan processing.
+The service is implemented as a Swift 6.3 package, including ScanSnap discovery, pairing, button
+sessions, JPEG acquisition, and PDF assembly. OCRmyPDF, Tesseract, qpdf, Poppler, libvips,
+ExifTool, and the optional SANE backend remain external command-line tools used for document
+processing and compatibility.
 
 ## Quick Start
 
@@ -18,6 +21,7 @@ docker run -d \
   --network host \
   --user "$(id -u):$(id -g)" \
   -e WEB_PORT=80 \
+  -e TZ="${TZ:-Europe/Berlin}" \
   -v "$PWD/scans:/scans" \
   ghcr.io/jollyjinx/scannerserver:latest
 ```
@@ -53,9 +57,12 @@ waiting for a periodic refresh. See [ScanSnap protocol notes](docs/protocol.md#p
 for packet directions and [configuration](docs/configuration.md#physical-button-troubleshooting)
 for firewall and log checks.
 
-Raw PDFs appear immediately in `./scans` after acquisition. For OCR-enabled multipage scans,
-blank-page removal and autocrop run on an isolated copy before the searchable `.ocr.pdf` is
-published; the original PDF remains unchanged and available throughout processing.
+Raw multipage PDFs appear immediately in `./scans` after acquisition, and the scanner button is
+rearmed before document processing begins. For single-page PDF and PNG modes, the captured raw
+document is handed directly to the bounded background queue; blank-page removal, autocrop, and
+final file splitting or image export happen there while the scanner is already available again.
+Without OCR, a processed multipage copy atomically replaces its raw PDF. With OCR, the original
+remains unchanged and the processed searchable `.ocr.pdf` is published beside it.
 
 ## Compose
 
@@ -80,27 +87,28 @@ The setup flow:
 
 1. Continuously discovers scanners on the local network using broadcast and ARP/neighbor entries while setup is open.
 2. Automatically chooses the scanner when exactly one iX500 is found; with multiple scanners, it shows them for manual selection.
-3. Keeps manual IPv4-address/host-name, serial-number, and Ethernet-address setup available while discovery runs.
+3. Keeps manual setup available while discovery runs, using an IPv4 address/host name and one field that accepts either the scanner password or product serial number.
 4. Reads the scanner serial number before pairing when the network permits it.
 5. Tries the factory-default password derived from the serial number.
-6. Stops discovery and asks for the scanner security key/password only when the default password is rejected or the serial number is unavailable.
+6. Tries the unified value as a serial-derived factory password and as the complete scanner password, retaining the entered form values in the browser when pairing fails.
 7. Saves the working scanner config in `/scans/.scannerserver-scanner.json`.
 
 It does not sweep every IP address in your subnet.
 
-For a scanner on another routed network, enter its IPv4 address or host name manually and provide
-its product serial number when available. Setup resolves host names to IPv4, tries the derived
-default first, then asks for the scanner security key/password if necessary. An Ethernet/MAC
-address cannot be used to calculate the security key and normally does not cross routers; it only
-helps discovery when the scanner is on the same local network.
+For a scanner on another routed network, enter its IPv4 address or host name and either its product
+serial number or scanner password. Setup resolves host names to IPv4 and first attempts targeted
+discovery. It derives the factory password from a discovered or entered serial number, then falls
+back to treating the complete entered value as the scanner password. The manual form does not ask
+for an Ethernet/MAC address or generated pairing key.
 
 ## Features
 
 - First-run ScanSnap Wi-Fi setup in the browser.
 - Web scan button and physical iX500 button support.
-- Saved scan modes for duplex/simplex, PDF/PNG, OCR, autocrop, and blank-page removal.
+- Saved scan modes for duplex/simplex, PDF/PNG, post-scan CPU count and priority, autocrop, and blank-page removal.
 - Scan list grouped by day with previews and download/delete controls.
-- Background OCR with OCRmyPDF and Tesseract.
+- CPU-budgeted background blank-page removal, autocrop, and OCR, including automatic container CPU
+  detection, bounded per-page concurrency, configurable caps, and optional reduced-priority nice mode.
 - Runs as a non-root user while still binding the web UI to port `80`.
 
 ## Updating
@@ -160,13 +168,15 @@ container is not required.
 ## More Documentation
 
 - [Documentation index](docs/index.md)
+- [Current Swift architecture](docs/architecture.md)
 - [Deployment and builds](docs/deployment.md)
 - [Configuration and scan behavior](docs/configuration.md)
 - [ScanSnap protocol notes](docs/protocol.md)
 - [Swift hardware validation](docs/swift-hardware-validation.md)
+- [Completed Python-to-Swift migration history](docs/history/swift-migration.md)
 
 ## References
 
-- [`bramheerink/scansnap`](https://github.com/bramheerink/scansnap) implements the reverse-engineered ScanSnap iX500 Wi-Fi protocol used by this image.
+- [`bramheerink/scansnap`](https://github.com/bramheerink/scansnap) was an important reference for the reverse-engineered ScanSnap iX500 Wi-Fi protocol now implemented natively in Swift.
 - [OCRmyPDF](https://ocrmypdf.readthedocs.io/) creates searchable PDFs.
 - [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) provides OCR language support.

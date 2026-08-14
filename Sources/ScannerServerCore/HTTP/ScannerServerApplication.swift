@@ -141,8 +141,7 @@ public protocol ScannerSetupServing: Sendable {
     func shutdown() async
     func discover() async -> ScannerSetupOutcome
     func select(deviceID: String) async -> ScannerSetupOutcome
-    func configureManually(ipAddress: String, macAddress: String, serial: String) async -> ScannerSetupOutcome
-    func savePassword(_ password: String) async -> ScannerSetupOutcome
+    func configureManually(ipAddress: String, credential: String) async -> ScannerSetupOutcome
     func clear() async -> ScannerSetupOutcome
 }
 
@@ -150,24 +149,6 @@ public extension ScannerSetupServing {
     func discoveryInProgress() async -> Bool { false }
     func ensureDiscoveryStarted() async {}
     func shutdown() async {}
-
-    func configureManually(
-        ipAddress: String,
-        macAddress: String,
-        serial: String,
-        securityKey: String
-    ) async -> ScannerSetupOutcome {
-        let outcome = await configureManually(
-            ipAddress: ipAddress,
-            macAddress: macAddress,
-            serial: serial
-        )
-        let securityKey = securityKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard outcome == .passwordNeeded, !securityKey.isEmpty else {
-            return outcome
-        }
-        return await savePassword(securityKey)
-    }
 }
 
 public actor StoredScannerSetupService: ScannerSetupServing {
@@ -196,10 +177,7 @@ public actor StoredScannerSetupService: ScannerSetupServing {
 
     public func discover() async -> ScannerSetupOutcome { .unavailable }
     public func select(deviceID: String) async -> ScannerSetupOutcome { .unavailable }
-    public func configureManually(ipAddress: String, macAddress: String, serial: String) async -> ScannerSetupOutcome {
-        .unavailable
-    }
-    public func savePassword(_ password: String) async -> ScannerSetupOutcome { .unavailable }
+    public func configureManually(ipAddress: String, credential: String) async -> ScannerSetupOutcome { .unavailable }
 
     public func clear() async -> ScannerSetupOutcome {
         do {
@@ -270,7 +248,10 @@ public struct ScannerServerDependencies: Sendable {
         self.scannerStore = scannerStore ?? ScannerConfigStore(environment: environment)
         self.scanJobs = scanJobs
         self.scanSnapAcquisitionSessions = scanSnapAcquisitionSessions
-        self.ocrQueue = ocrQueue ?? OCRQueueActor(executor: FoundationProcessExecutor())
+        self.ocrQueue = ocrQueue ?? OCRQueueActor(
+            executor: FoundationProcessExecutor(),
+            configuration: OCRQueueConfiguration(environment: environment)
+        )
         self.outputPathResolver = outputPathResolver
         self.scannerSetup = scannerSetup
         self.previewProvider = previewProvider
@@ -291,7 +272,11 @@ public struct ScannerServerDependencies: Sendable {
         let processExecutor = FoundationProcessExecutor()
         let documentExecutor = NativeDocumentToolExecutor(executor: processExecutor)
         let webUpdates = WebUpdateNotifier()
-        let ocrQueue = OCRQueueActor(executor: processExecutor, webUpdates: webUpdates)
+        let ocrQueue = OCRQueueActor(
+            executor: processExecutor,
+            configuration: OCRQueueConfiguration(environment: environment),
+            webUpdates: webUpdates
+        )
         let settingsStore = ScanSettingsStore(environment: environment)
         let scannerStore = ScannerConfigStore(environment: environment)
         let buttonConfigurationChanges = ScanSnapButtonConfigurationChangeCoordinator()
@@ -478,23 +463,17 @@ public enum ScannerServerApplication {
         router.post("/setup/scanners/manual") { request, context -> Response in
             let form = try await decodeForm(ScannerManualForm.self, request: request, context: context)
             let ipAddress = form.scannerIP ?? ""
-            let macAddress = form.scannerMAC ?? ""
-            guard !ipAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    || !macAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let credential = form.scannerCredential ?? ""
+            guard !ipAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !credential.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return Response.redirect(to: "/?setup=manual-missing")
             }
             return redirect(
                 setup: await dependencies.scannerSetup.configureManually(
                     ipAddress: ipAddress,
-                    macAddress: macAddress,
-                    serial: form.scannerSerial ?? "",
-                    securityKey: form.scannerSecurityKey ?? ""
+                    credential: credential
                 )
             )
-        }
-        router.post("/setup/scanners/password") { request, context -> Response in
-            let form = try await decodeForm(ScannerPasswordForm.self, request: request, context: context)
-            return redirect(setup: await dependencies.scannerSetup.savePassword(form.scannerPassword ?? ""))
         }
         router.post("/setup/scanners/clear") { _, _ -> Response in
             redirect(setup: await dependencies.scannerSetup.clear())
@@ -555,6 +534,8 @@ private struct ModeSaveForm: Decodable {
     let format: String?
     let pageMode: String?
     let ocrEnabled: String?
+    let ocrCPULimit: String?
+    let ocrNice: String?
     let removeBlankPages: String?
     let cropPages: String?
     let cropMarginPoints: String?
@@ -571,6 +552,8 @@ private struct ModeSaveForm: Decodable {
         case format = "SCAN_FORMAT"
         case pageMode = "SCAN_PAGE_MODE"
         case ocrEnabled = "SCAN_OCR_ENABLED"
+        case ocrCPULimit = "SCAN_OCR_CPU_LIMIT"
+        case ocrNice = "SCAN_OCR_NICE"
         case removeBlankPages = "SCAN_REMOVE_BLANK_PAGES"
         case cropPages = "SCAN_CROP_PAGES"
         case cropMarginPoints = "SCAN_CROP_MARGIN_POINTS"
@@ -588,6 +571,8 @@ private struct ModeSaveForm: Decodable {
             "SCAN_FORMAT": format ?? "pdf",
             "SCAN_PAGE_MODE": pageMode ?? "multi",
             "SCAN_OCR_ENABLED": ocrEnabled == nil ? "false" : "true",
+            "SCAN_OCR_CPU_LIMIT": ocrCPULimit ?? "",
+            "SCAN_OCR_NICE": ocrNice ?? "false",
             "SCAN_REMOVE_BLANK_PAGES": removeBlankPages == nil ? "false" : "true",
             "SCAN_CROP_PAGES": cropPages == nil ? "false" : "true",
             "SCAN_CROP_MARGIN_POINTS": cropMarginPoints ?? "",
@@ -602,20 +587,11 @@ private struct ScannerSelectForm: Decodable {
 
 private struct ScannerManualForm: Decodable {
     let scannerIP: String?
-    let scannerMAC: String?
-    let scannerSerial: String?
-    let scannerSecurityKey: String?
+    let scannerCredential: String?
     enum CodingKeys: String, CodingKey {
         case scannerIP = "scanner_ip"
-        case scannerMAC = "scanner_mac"
-        case scannerSerial = "scanner_serial"
-        case scannerSecurityKey = "scanner_security_key"
+        case scannerCredential = "scanner_credential"
     }
-}
-
-private struct ScannerPasswordForm: Decodable {
-    let scannerPassword: String?
-    enum CodingKeys: String, CodingKey { case scannerPassword = "scanner_password" }
 }
 
 private func decodeForm<Form: Decodable>(
@@ -754,9 +730,13 @@ private func indexResponse(
     let ocr = await dependencies.ocrQueue.state
     let setup = await dependencies.scannerSetup.state()
     let scannerIsReachable = await dependencies.scannerReachability.isReachable
+    let localTime = ScannerServerLocalTime(environment: dependencies.environment)
     let query = queryValues(request.uri.query)
     let webRevision = await dependencies.webUpdates.currentRevision
-    let groups = scanFileGroups(outputDirectory: dependencies.outputPathResolver.outputDirectory)
+    let groups = scanFileGroups(
+        outputDirectory: dependencies.outputPathResolver.outputDirectory,
+        timeZone: localTime.timeZone
+    )
     let content = renderIndexContent(
         settings: settings,
         editModeID: query["edit_mode"],
@@ -766,7 +746,8 @@ private func indexResponse(
         wifiBackend: wifiBackend,
         job: job,
         ocr: ocr,
-        groups: groups
+        groups: groups,
+        localTime: localTime
     )
     let html = template
         .replacingOccurrences(of: "<!-- SCANNER_SERVER_REFRESH -->", with: "")
@@ -779,7 +760,7 @@ private func indexResponse(
     return dataResponse(Data(html.utf8), contentType: "text/html; charset=utf-8")
 }
 
-private func scanFileGroups(outputDirectory: URL) -> [ScanDayGroup] {
+private func scanFileGroups(outputDirectory: URL, timeZone: TimeZone) -> [ScanDayGroup] {
     guard let urls = try? FileManager.default.contentsOfDirectory(
         at: outputDirectory,
         includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
@@ -792,7 +773,7 @@ private func scanFileGroups(outputDirectory: URL) -> [ScanDayGroup] {
               values.isRegularFile == true else { return nil }
         return ScanFile(name: name, modificationDate: values.contentModificationDate ?? .distantPast)
     }
-    return ScanFileGrouping.groups(for: files)
+    return ScanFileGrouping.groups(for: files, timeZone: timeZone)
 }
 
 private func renderIndexContent(
@@ -804,7 +785,8 @@ private func renderIndexContent(
     wifiBackend: Bool,
     job: ScanJobState,
     ocr: OCRQueueState,
-    groups: [ScanDayGroup]
+    groups: [ScanDayGroup],
+    localTime: ScannerServerLocalTime
 ) -> String {
     let selectedMode: ScanMode
     if editModeID == "new" {
@@ -842,10 +824,11 @@ private func renderIndexContent(
         html += renderModes(
             settings: settings,
             selectedMode: selectedMode,
+            maximumOCRCPUs: ocr.cpuLimit,
             scannerSetup: wifiBackend ? setup : nil,
             open: editModeID != nil
         )
-        html += renderStatus(job: job, ocr: ocr)
+        html += renderStatus(job: job, ocr: ocr, localTime: localTime)
         html += renderFiles(groups)
     }
     return html
@@ -886,22 +869,17 @@ private func renderScannerSetupContent(_ setup: ScannerSetupState) -> String {
     let errorHidden = setup.lastError.isEmpty ? " hidden" : ""
     html += "<pre data-scanner-setup-error\(errorHidden)>\(htmlEscape(setup.lastError))</pre>"
     if setup.needsPassword {
-        html += "<p class=\"muted\" data-scanner-discovery-status>Automatic discovery is paused while setup waits for the scanner password.</p>"
+        html += "<p class=\"muted\" data-scanner-discovery-status>Automatic discovery is paused. Correct the scanner password or product serial number and try again.</p>"
     } else if !setup.configured {
         html += "<p class=\"muted\" data-scanner-discovery-status>Looking for scanners automatically…</p>"
     }
     html += "<div class=\"setup-controls\"><form method=\"post\" action=\"/setup/scanners/discover\"><button>Discover scanners</button></form>"
     html += "<div data-scanner-devices>\(renderScannerDevices(setup.devices))</div>"
-    html += "<form method=\"post\" action=\"/setup/scanners/manual\">"
-    html += "<label>Scanner IPv4 address or host name<input name=\"scanner_ip\" value=\"\(htmlEscape(setup.ipAddress))\"></label>"
-    html += "<p class=\"muted\">For a scanner on another network, enter its IPv4 address or host name and product serial number. Host names are resolved to IPv4 during setup. If its default password was changed, setup will ask for the password after trying the serial-derived default.</p>"
-    html += "<label>Product serial number<input name=\"scanner_serial\"></label>"
-    html += "<label>Ethernet address (same network only)<input name=\"scanner_mac\"></label>"
-    html += "<p class=\"muted\">The security key cannot be derived from the Ethernet address. The address only helps discovery on the same local network.</p>"
+    html += "<form method=\"post\" action=\"/setup/scanners/manual\" data-scanner-manual-form>"
+    html += "<label>Scanner IPv4 address or host name<input name=\"scanner_ip\" value=\"\(htmlEscape(setup.ipAddress))\" required></label>"
+    html += "<label>Scanner password or product serial number<input type=\"text\" name=\"scanner_credential\" required></label>"
+    html += "<p class=\"muted\">If you never changed the scanner password, enter the product serial number printed on the scanner. The factory password will be derived automatically.</p>"
     html += "<button>Connect scanner</button></form>"
-    if setup.needsPassword {
-        html += "<form method=\"post\" action=\"/setup/scanners/password\"><label>Security key or scanner password<input type=\"text\" name=\"scanner_password\" autofocus></label><button>Try password</button></form>"
-    }
     html += "<form method=\"post\" action=\"/setup/scanners/clear\"><button class=\"danger-button\">Clear scanner setup</button></form></div>"
     return html
 }
@@ -919,6 +897,7 @@ private func renderScannerDevices(_ devices: [ScannerSetupDevice]) -> String {
 private func renderModes(
     settings: ScanSettings,
     selectedMode: ScanMode,
+    maximumOCRCPUs: Int,
     scannerSetup: ScannerSetupState?,
     open: Bool
 ) -> String {
@@ -1001,12 +980,35 @@ private func renderModes(
         selected: selectedMode.settings.language,
         help: "Languages used by Tesseract when OCR is enabled."
     )
+    var cpuChoices = [("", "Automatic (up to \(maximumOCRCPUs))")]
+    cpuChoices += (1...max(1, maximumOCRCPUs)).map { (String($0), "\($0)") }
+    if let selectedLimit = selectedMode.settings.ocrCPULimit,
+       selectedLimit > maximumOCRCPUs {
+        cpuChoices.append((
+            String(selectedLimit),
+            "\(selectedLimit) (currently capped to \(maximumOCRCPUs))"
+        ))
+    }
+    html += select(
+        name: "SCAN_OCR_CPU_LIMIT",
+        label: "Processing CPUs",
+        values: cpuChoices,
+        selected: selectedMode.settings.ocrCPULimitText,
+        help: "Automatic uses the background CPU allowance while reserving one processor for scanning and the web service."
+    )
+    html += select(
+        name: "SCAN_OCR_NICE",
+        label: "Post-scan priority",
+        values: [("false", "Normal"), ("true", "Niced (reduced)")],
+        selected: selectedMode.settings.ocrNiceText,
+        help: "Niced background processing yields CPU time while scanning and the web service remain at normal priority."
+    )
     html += "</div><div class=\"setting-card\">"
     html += checkbox(
         name: "SCAN_CROP_PAGES",
         label: "Autocrop",
         checked: selectedMode.settings.cropPages,
-        help: "Trim scanner-bed borders around detected paper before OCR."
+        help: "Trim scanner-bed borders around detected paper during background processing."
     )
     html += numberInput(
         name: "SCAN_CROP_MARGIN_POINTS",
@@ -1021,7 +1023,7 @@ private func renderModes(
         name: "SCAN_REMOVE_BLANK_PAGES",
         label: "Remove blanks",
         checked: selectedMode.settings.removeBlankPages,
-        help: "Discard pages detected as blank before OCR for PDF output."
+        help: "Discard pages detected as blank during background PDF processing."
     )
     html += "</div></div></fieldset>"
     html += "<fieldset class=\"setting-group\"><legend>Physical button</legend>"
@@ -1044,26 +1046,46 @@ private func renderModes(
     return html
 }
 
-private func renderStatus(job: ScanJobState, ocr: OCRQueueState) -> String {
+private func renderStatus(
+    job: ScanJobState,
+    ocr: OCRQueueState,
+    localTime: ScannerServerLocalTime
+) -> String {
     var html = "<section><h2>Status</h2><p><span class=\"status\">\(htmlEscape(job.status))</span></p>"
-    if let started = job.started { html += "<p>Started: \(htmlEscape(timestamp(started)))</p>" }
-    if let finished = job.finished { html += "<p>Finished: \(htmlEscape(timestamp(finished)))</p>" }
+    if let started = job.started {
+        html += "<p>Started: \(htmlEscape(localTime.statusTimestamp(for: started)))</p>"
+    }
+    if let finished = job.finished {
+        html += "<p>Finished: \(htmlEscape(localTime.statusTimestamp(for: finished)))</p>"
+    }
     if !job.output.isEmpty { html += "<pre>\(htmlEscape(job.output))</pre>" }
     if !job.error.isEmpty { html += "<pre>\(htmlEscape(job.error))</pre>" }
 
-    html += "<h2>OCR</h2><p><span class=\"status\">\(htmlEscape(ocr.status))</span>"
+    html += "<h2>Background processing</h2><p><span class=\"status\">\(htmlEscape(ocr.status))</span>"
+    if ocr.running > 1 { html += " \(ocr.running) jobs active" }
     if ocr.queued > 0 { html += " \(ocr.queued) queued" }
     html += "</p>"
-    if ocr.status == "running" || ocr.status == "queued" || ocr.queued > 0 {
-        html += "<form method=\"post\" action=\"/ocr/cancel\"><button class=\"danger-button\">Cancel OCR</button></form>"
+    html += "<p>CPU budget: \(ocr.cpuLimit); priority: "
+    if let niceLevel = ocr.niceLevel {
+        html += "nice +\(niceLevel)"
+    } else {
+        html += "normal"
     }
-    if let started = ocr.started { html += "<p>Started: \(htmlEscape(timestamp(started)))</p>" }
-    if let finished = ocr.finished { html += "<p>Finished: \(htmlEscape(timestamp(finished)))</p>" }
+    html += "</p>"
+    if ocr.status == "running" || ocr.status == "queued" || ocr.queued > 0 {
+        html += "<form method=\"post\" action=\"/ocr/cancel\"><button class=\"danger-button\">Cancel processing</button></form>"
+    }
+    if let started = ocr.started {
+        html += "<p>Started: \(htmlEscape(localTime.statusTimestamp(for: started)))</p>"
+    }
+    if let finished = ocr.finished {
+        html += "<p>Finished: \(htmlEscape(localTime.statusTimestamp(for: finished)))</p>"
+    }
     if !ocr.input.isEmpty { html += "<p>Input: \(htmlEscape(ocr.input))</p>" }
     if !ocr.output.isEmpty { html += "<pre>\(htmlEscape(ocr.output))</pre>" }
     if !ocr.error.isEmpty { html += "<pre>\(htmlEscape(ocr.error))</pre>" }
     if !ocr.recentJobs.isEmpty {
-        html += "<h3>Recent OCR jobs</h3><ul class=\"ocr-history\">"
+        html += "<h3>Recent processing jobs</h3><ul class=\"ocr-history\">"
         for recent in ocr.recentJobs {
             let name = URL(fileURLWithPath: recent.input).lastPathComponent
             html += "<li><span class=\"file-name\">\(htmlEscape(name))</span>: "
@@ -1171,11 +1193,11 @@ private func setupMessage(_ code: String?) -> String? {
     switch code {
     case "discovery-started": "Scanner discovery started."
     case "no-device": "Choose a discovered scanner."
-    case "manual-missing": "Enter a scanner IPv4 address, host name, or Ethernet address."
+    case "manual-missing": "Enter the scanner IPv4 address or host name and its password or product serial number."
     case "manual-not-found": "No scanner matching those details was found."
     case "manual-invalid": "The scanner details are invalid."
-    case "password-needed": "Enter the scanner security key or password to finish setup."
-    case "password-failed": "The scanner security key or password was rejected."
+    case "password-needed": "Enter the scanner password or product serial number to finish setup."
+    case "password-failed": "The scanner password or product serial number was rejected."
     case "configured": "Scanner configured."
     case "cleared": "Scanner setup cleared."
     case "setup-required": "Choose a Wi-Fi scanner before starting a scan."
@@ -1216,12 +1238,6 @@ private func urlQueryValue(_ value: String) -> String {
     var allowed = CharacterSet.urlQueryAllowed
     allowed.remove(charactersIn: "&=+#")
     return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
-}
-
-private func timestamp(_ date: Date) -> String {
-    let formatter = ISO8601DateFormatter()
-    formatter.formatOptions = [.withInternetDateTime]
-    return formatter.string(from: date)
 }
 
 private func loadIndexHTML() throws -> String {
