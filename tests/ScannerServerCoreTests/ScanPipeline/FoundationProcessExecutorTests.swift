@@ -63,7 +63,10 @@ struct FoundationProcessExecutorTests {
         )
         #expect(result.exitStatus == 0)
         #expect(reportedNiceLevel != nil)
+#if os(Linux)
+        // Scanner containers run on Linux, where `nice` must affect the child process.
         #expect((reportedNiceLevel ?? 0) >= 10)
+#endif
     }
 
     @Test("Cancellation kills a TERM-ignoring process group and pipe-holding descendant")
