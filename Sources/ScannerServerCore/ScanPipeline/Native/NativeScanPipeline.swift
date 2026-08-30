@@ -1,7 +1,37 @@
 import Foundation
 
+public enum NativeScanPostProcessing: Equatable, Sendable {
+    case none
+    case queuePublishedOutputs
+    case deferred(DeferredScanProcessing)
+    case alreadyHandled
+}
+
+public struct NativeScanResult: Equatable, Sendable {
+    public let process: ProcessResult
+    public let postProcessing: NativeScanPostProcessing
+
+    public init(
+        process: ProcessResult,
+        postProcessing: NativeScanPostProcessing = .none
+    ) {
+        self.process = process
+        self.postProcessing = postProcessing
+    }
+
+    public var exitStatus: Int32 { process.exitStatus }
+    public var standardOutput: String { process.standardOutput }
+    public var standardError: String { process.standardError }
+    public var succeeded: Bool { process.succeeded }
+
+    public var deferredScanProcessing: DeferredScanProcessing? {
+        guard case .deferred(let processing) = postProcessing else { return nil }
+        return processing
+    }
+}
+
 public protocol NativeScanExecuting: Sendable {
-    func scan(configuration: ScanPipelineConfiguration) async throws -> ProcessResult
+    func scan(configuration: ScanPipelineConfiguration) async throws -> NativeScanResult
 }
 
 public actor NativeScanPipeline: NativeScanExecuting {
@@ -10,6 +40,7 @@ public actor NativeScanPipeline: NativeScanExecuting {
 
     private let executor: any ProcessExecutor
     private let wifiAcquirer: any ScanSnapWiFiAcquiring
+    private let ocrQueue: OCRQueueActor?
     private let acquisitionSessions: ScanSnapAcquisitionSessionCoordinator
     private let fileSystem: any NativeScanFileSystem
     private let timestampProvider: TimestampProvider?
@@ -18,6 +49,7 @@ public actor NativeScanPipeline: NativeScanExecuting {
     public init(
         executor: any ProcessExecutor,
         wifiAcquirer: any ScanSnapWiFiAcquiring = ScanSnapWiFiAcquisitionClient(),
+        ocrQueue: OCRQueueActor? = nil,
         acquisitionSessions: ScanSnapAcquisitionSessionCoordinator = ScanSnapAcquisitionSessionCoordinator(),
         fileSystem: any NativeScanFileSystem = FoundationNativeScanFileSystem(),
         timestampProvider: TimestampProvider? = nil,
@@ -25,13 +57,14 @@ public actor NativeScanPipeline: NativeScanExecuting {
     ) {
         self.executor = executor
         self.wifiAcquirer = wifiAcquirer
+        self.ocrQueue = ocrQueue
         self.acquisitionSessions = acquisitionSessions
         self.fileSystem = fileSystem
         self.timestampProvider = timestampProvider
         self.workDirectorySuffixProvider = workDirectorySuffixProvider
     }
 
-    public func scan(configuration: ScanPipelineConfiguration) async throws -> ProcessResult {
+    public func scan(configuration: ScanPipelineConfiguration) async throws -> NativeScanResult {
         let acquisitionSessionMode = await acquisitionSessions.consumeForAcquisition()
         let environment = configuration.environment
         let outputDirectory = URL(
@@ -42,12 +75,18 @@ public actor NativeScanPipeline: NativeScanExecuting {
         do {
             try fileSystem.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         } catch {
-            return failure(status: 1, message: "Could not create scan output directory: \(error.localizedDescription)")
+            return NativeScanResult(process: failure(
+                status: 1,
+                message: "Could not create scan output directory: \(error.localizedDescription)"
+            ))
         }
 
         let suffix = workDirectorySuffixProvider()
         guard isValidPathComponent(suffix) else {
-            return failure(status: 64, message: "Invalid native scan work-directory suffix.")
+            return NativeScanResult(process: failure(
+                status: 64,
+                message: "Invalid native scan work-directory suffix."
+            ))
         }
         let workDirectory = outputDirectory.appendingPathComponent(
             ".scan-work.\(suffix)",
@@ -57,7 +96,10 @@ public actor NativeScanPipeline: NativeScanExecuting {
         do {
             try fileSystem.createDirectory(at: workDirectory, withIntermediateDirectories: false)
         } catch {
-            return failure(status: 1, message: "Could not create scan work directory: \(error.localizedDescription)")
+            return NativeScanResult(process: failure(
+                status: 1,
+                message: "Could not create scan work directory: \(error.localizedDescription)"
+            ))
         }
         var pipelineOwnsWorkDirectory = true
         defer {
@@ -67,30 +109,67 @@ public actor NativeScanPipeline: NativeScanExecuting {
         }
 
         let capturingExecutor = NativeScanCapturingExecutor(executor: executor)
+        var activeStreamingBatchID: UUID?
+        let rawPDF = workDirectory.appendingPathComponent("raw.pdf", isDirectory: false)
         do {
             let timestamp = try scanTimestamp(environment: environment)
-            let rawPDF = workDirectory.appendingPathComponent("raw.pdf", isDirectory: false)
+            let streamingBatchID: UUID?
+            if let ocrQueue,
+               (nonEmpty(environment["SCAN_BACKEND"]) ?? "wifi") == "wifi",
+               configuration.format == "pdf",
+               configuration.pageMode == "multi",
+               configuration.ocrEnabled
+            {
+                streamingBatchID = await ocrQueue.beginStreamingScan(StreamingScanRequest(
+                    documentName: "\(timestamp.rawValue).pdf",
+                    finalOutputPath: outputDirectory
+                        .appendingPathComponent("\(timestamp.rawValue).ocr.pdf")
+                        .path,
+                    workDirectory: workDirectory,
+                    environment: environment,
+                    removeBlankPages: configuration.removeBlankPages,
+                    cropPages: configuration.cropPages
+                ))
+            } else {
+                streamingBatchID = nil
+            }
+            activeStreamingBatchID = streamingBatchID
 
-            if let acquisitionFailure = try await acquireRawPDF(
+            let acquisition = try await acquireRawPDF(
                 configuration: configuration,
                 acquisitionSessionMode: acquisitionSessionMode,
                 rawPDF: rawPDF,
                 workDirectory: workDirectory,
-                executor: capturingExecutor
-            ) {
-                return await completedFailure(acquisitionFailure, diagnosticsFrom: capturingExecutor)
+                executor: capturingExecutor,
+                streamingBatchID: streamingBatchID
+            )
+            if let acquisitionFailure = acquisition.failure {
+                await cancelStreamingScanIfActive(
+                    batchID: activeStreamingBatchID,
+                    publishRawFallback: fileSystem.regularFileExists(at: rawPDF)
+                )
+                activeStreamingBatchID = nil
+                return NativeScanResult(process: await completedFailure(
+                    acquisitionFailure,
+                    diagnosticsFrom: capturingExecutor
+                ))
             }
 
             guard fileSystem.regularFileExists(at: rawPDF) else {
-                return await failure(
+                await cancelStreamingScanIfActive(batchID: activeStreamingBatchID, publishRawFallback: false)
+                activeStreamingBatchID = nil
+                return NativeScanResult(process: await failure(
                     status: 2,
                     message: "No scan output was created by the scanner backend.",
                     diagnosticsFrom: capturingExecutor
-                )
+                ))
             }
 
             let options = try DocumentProcessingOptions(environment: environment)
             if configuration.format == "pdf", configuration.pageMode == "multi" {
+                let publishRawPDF = !(configuration.ocrOnly
+                    && configuration.ocrEnabled
+                    && streamingBatchID != nil)
                 try await processForMultipagePDF(
                     rawPDF: rawPDF,
                     outputDirectory: outputDirectory,
@@ -98,22 +177,47 @@ public actor NativeScanPipeline: NativeScanExecuting {
                     configuration: configuration,
                     options: options,
                     workDirectory: workDirectory,
-                    executor: capturingExecutor
+                    executor: capturingExecutor,
+                    publishRawPDF: publishRawPDF
                 )
-                let outputPath = outputDirectory
-                    .appendingPathComponent("\(timestamp.rawValue).pdf", isDirectory: false)
-                    .path
-                guard fileSystem.regularFileExists(at: URL(fileURLWithPath: outputPath)) else {
-                    return await failure(
-                        status: 2,
-                        message: "No output files were created.",
-                        diagnosticsFrom: capturingExecutor
-                    )
+                let outputPath = publishRawPDF
+                    ? outputDirectory
+                        .appendingPathComponent("\(timestamp.rawValue).pdf", isDirectory: false)
+                        .path
+                    : outputDirectory
+                        .appendingPathComponent("\(timestamp.rawValue).ocr.pdf", isDirectory: false)
+                        .path
+                if publishRawPDF {
+                    guard fileSystem.regularFileExists(at: URL(fileURLWithPath: outputPath)) else {
+                        await cancelStreamingScanIfActive(
+                            batchID: activeStreamingBatchID,
+                            publishRawFallback: fileSystem.regularFileExists(at: rawPDF)
+                        )
+                        activeStreamingBatchID = nil
+                        return NativeScanResult(process: await failure(
+                            status: 2,
+                            message: "No output files were created.",
+                            diagnosticsFrom: capturingExecutor
+                        ))
+                    }
                 }
-                return ProcessResult(
-                    exitStatus: 0,
-                    standardOutput: outputPath + "\n",
-                    standardError: await capturingExecutor.standardError
+                if let streamingBatchID, let ocrQueue {
+                    pipelineOwnsWorkDirectory = false
+                    try await ocrQueue.finishStreamingScan(
+                        batchID: streamingBatchID,
+                        pageCount: acquisition.pageCount ?? 0
+                    )
+                    activeStreamingBatchID = nil
+                }
+                return NativeScanResult(
+                    process: ProcessResult(
+                        exitStatus: 0,
+                        standardOutput: outputPath + "\n",
+                        standardError: await capturingExecutor.standardError
+                    ),
+                    postProcessing: streamingBatchID == nil
+                        ? .queuePublishedOutputs
+                        : .alreadyHandled
                 )
             }
 
@@ -126,53 +230,101 @@ public actor NativeScanPipeline: NativeScanExecuting {
                 workDirectory: workDirectory
             )
             pipelineOwnsWorkDirectory = false
-            return ProcessResult(
-                exitStatus: 0,
-                standardError: await capturingExecutor.standardError,
-                deferredScanProcessing: deferredProcessing
+            return NativeScanResult(
+                process: ProcessResult(
+                    exitStatus: 0,
+                    standardError: await capturingExecutor.standardError
+                ),
+                postProcessing: .deferred(deferredProcessing)
             )
         } catch is CancellationError {
+            await cancelStreamingScanIfActive(batchID: activeStreamingBatchID, publishRawFallback: false)
+            activeStreamingBatchID = nil
             throw CancellationError()
         } catch let error as NativeScanConfigurationError {
-            return await failure(
+            await cancelStreamingScanIfActive(
+                batchID: activeStreamingBatchID,
+                publishRawFallback: fileSystem.regularFileExists(at: rawPDF)
+            )
+            activeStreamingBatchID = nil
+            return NativeScanResult(process: await failure(
                 status: 64,
                 message: error.localizedDescription,
                 diagnosticsFrom: capturingExecutor
-            )
+            ))
         } catch let error as NativeScanFileSystemError {
+            let removed = await cancelStreamingScanIfActive(
+                batchID: activeStreamingBatchID,
+                publishRawFallback: fileSystem.regularFileExists(at: rawPDF)
+            )
+            activeStreamingBatchID = nil
             switch error {
             case .outputConflict:
-                return await failure(
+                return NativeScanResult(process: await failure(
                     status: 73,
-                    message: error.localizedDescription,
+                    message: error.localizedDescription
+                        + retentionNote(workDirectory, retained: !removed),
                     diagnosticsFrom: capturingExecutor
-                )
+                ))
             }
         } catch let error as DocumentProcessingError {
-            return await failure(
-                status: error.compatibleExitStatus,
-                message: documentProcessingDiagnostic(error),
-                diagnosticsFrom: capturingExecutor
+            let removed = await cancelStreamingScanIfActive(
+                batchID: activeStreamingBatchID,
+                publishRawFallback: fileSystem.regularFileExists(at: rawPDF)
             )
+            activeStreamingBatchID = nil
+            return NativeScanResult(process: await failure(
+                status: error.compatibleExitStatus,
+                message: documentProcessingDiagnostic(error)
+                    + retentionNote(workDirectory, retained: !removed),
+                diagnosticsFrom: capturingExecutor
+            ))
         } catch is NativeScanMissingOutputError {
-            return await failure(
+            await cancelStreamingScanIfActive(
+                batchID: activeStreamingBatchID,
+                publishRawFallback: fileSystem.regularFileExists(at: rawPDF)
+            )
+            activeStreamingBatchID = nil
+            return NativeScanResult(process: await failure(
                 status: 2,
                 message: "No output files were created.",
                 diagnosticsFrom: capturingExecutor
-            )
+            ))
         } catch let error as ProcessExecutorError {
-            return await failure(
+            let removed = await cancelStreamingScanIfActive(
+                batchID: activeStreamingBatchID,
+                publishRawFallback: fileSystem.regularFileExists(at: rawPDF)
+            )
+            activeStreamingBatchID = nil
+            return NativeScanResult(process: await failure(
                 status: 127,
-                message: error.localizedDescription,
+                message: error.localizedDescription + retentionNote(workDirectory, retained: !removed),
                 diagnosticsFrom: capturingExecutor
-            )
+            ))
         } catch {
-            return await failure(
-                status: 1,
-                message: error.localizedDescription,
-                diagnosticsFrom: capturingExecutor
+            let removed = await cancelStreamingScanIfActive(
+                batchID: activeStreamingBatchID,
+                publishRawFallback: fileSystem.regularFileExists(at: rawPDF)
             )
+            activeStreamingBatchID = nil
+            return NativeScanResult(process: await failure(
+                status: 1,
+                message: error.localizedDescription + retentionNote(workDirectory, retained: !removed),
+                diagnosticsFrom: capturingExecutor
+            ))
         }
+    }
+
+    @discardableResult
+    private func cancelStreamingScanIfActive(batchID: UUID?, publishRawFallback: Bool) async -> Bool {
+        guard let batchID, let ocrQueue else { return true }
+        return await ocrQueue.cancelStreamingScan(batchID: batchID, publishRawFallback: publishRawFallback)
+    }
+
+    private func retentionNote(_ workDirectory: URL, retained: Bool) -> String {
+        retained
+            ? "\nThe raw scan was retained in \(workDirectory.path) because publishing the fallback failed."
+            : ""
     }
 
     private func acquireRawPDF(
@@ -180,8 +332,9 @@ public actor NativeScanPipeline: NativeScanExecuting {
         acquisitionSessionMode: ScanSnapAcquisitionSessionMode,
         rawPDF: URL,
         workDirectory: URL,
-        executor: NativeScanCapturingExecutor
-    ) async throws -> ProcessResult? {
+        executor: NativeScanCapturingExecutor,
+        streamingBatchID: UUID?
+    ) async throws -> (failure: ProcessResult?, pageCount: Int?) {
         let environment = configuration.environment
         switch nonEmpty(environment["SCAN_BACKEND"]) ?? "wifi" {
         case "sane":
@@ -201,7 +354,7 @@ public actor NativeScanPipeline: NativeScanExecuting {
                 environment: environment,
                 workingDirectory: workDirectory
             ))
-            guard scanResult.succeeded else { return scanResult }
+            guard scanResult.succeeded else { return (scanResult, nil) }
 
             let pages = try fileSystem.regularFiles(
                 in: workDirectory,
@@ -209,9 +362,12 @@ public actor NativeScanPipeline: NativeScanExecuting {
                 pathExtension: "pnm"
             )
             guard !pages.isEmpty else {
-                return ProcessResult(
-                    exitStatus: 2,
-                    standardError: "No pages were scanned. Check that paper is loaded and SCAN_SOURCE matches the scanner options."
+                return (
+                    ProcessResult(
+                        exitStatus: 2,
+                        standardError: "No pages were scanned. Check that paper is loaded and SCAN_SOURCE matches the scanner options."
+                    ),
+                    nil
                 )
             }
 
@@ -221,7 +377,7 @@ public actor NativeScanPipeline: NativeScanExecuting {
                 environment: environment,
                 workingDirectory: workDirectory
             ))
-            return imageResult.succeeded ? nil : imageResult
+            return imageResult.succeeded ? (nil, pages.count) : (imageResult, nil)
 
         case "wifi":
             guard let scannerIP = nonEmpty(environment["SCANNER_IP"]) else {
@@ -265,7 +421,7 @@ public actor NativeScanPipeline: NativeScanExecuting {
                 || configuration.source.contains("Simplex")
                 || configuration.source.contains("simplex")
             let buttonConfiguration = ScanSnapButtonConfiguration(environment: environment)
-            let result = try await wifiAcquirer.acquire(ScanSnapWiFiAcquisitionRequest(
+            let request = ScanSnapWiFiAcquisitionRequest(
                 scannerIPAddress: scannerIP,
                 identity: ScanSnapIdentity(pairingKey),
                 clientIPAddress: clientIPAddress,
@@ -277,9 +433,17 @@ public actor NativeScanPipeline: NativeScanExecuting {
                 outputURL: rawPDF,
                 registrationSourcePort: buttonConfiguration.registrationSourcePort,
                 registrationPort: buttonConfiguration.registrationPort
-            ))
+            )
+            let result: ScanSnapWiFiAcquisitionResult
+            if let streamingBatchID, let ocrQueue {
+                result = try await wifiAcquirer.acquire(request) { page in
+                    try await ocrQueue.submitStreamingPage(batchID: streamingBatchID, page: page)
+                }
+            } else {
+                result = try await wifiAcquirer.acquire(request)
+            }
             await executor.recordDiagnostic(result.diagnostics)
-            return nil
+            return (nil, result.pageCount)
 
         case let backend:
             throw NativeScanConfigurationError.message("Unsupported SCAN_BACKEND: \(backend)")
@@ -293,7 +457,8 @@ public actor NativeScanPipeline: NativeScanExecuting {
         configuration: ScanPipelineConfiguration,
         options: DocumentProcessingOptions,
         workDirectory: URL,
-        executor: NativeScanCapturingExecutor
+        executor: NativeScanCapturingExecutor,
+        publishRawPDF: Bool = true
     ) async throws {
         try await executeDocumentStep(
             .setCreatorMetadata,
@@ -307,6 +472,7 @@ public actor NativeScanPipeline: NativeScanExecuting {
             throw NativeScanMissingOutputError()
         }
         try Task.checkCancellation()
+        guard publishRawPDF else { return }
         let destination = outputDirectory.appendingPathComponent(
             "\(timestamp.rawValue).pdf",
             isDirectory: false
@@ -322,6 +488,9 @@ public actor NativeScanPipeline: NativeScanExecuting {
         options: DocumentProcessingOptions,
         workDirectory: URL
     ) -> DeferredScanProcessing {
+        let ocrOnly = configuration.ocrOnly
+            && configuration.ocrEnabled
+            && configuration.format == "pdf"
         let finalOutput: DocumentFinalOutputRequest
         if configuration.format == "png" {
             finalOutput = .exportImages(ExportScanImagesRequest(
@@ -332,7 +501,7 @@ public actor NativeScanPipeline: NativeScanExecuting {
         } else {
             finalOutput = .splitPDF(SplitPDFPagesRequest(
                 pdfPath: rawPDF.path,
-                outputDirectory: outputDirectory.path,
+                outputDirectory: ocrOnly ? workDirectory.path : outputDirectory.path,
                 prefix: timestamp
             ))
         }
@@ -353,7 +522,8 @@ public actor NativeScanPipeline: NativeScanExecuting {
             inputPath: rawPDF.path,
             cleanupDirectory: workDirectory,
             plan: plan,
-            ocrEnabled: configuration.ocrEnabled && configuration.format == "pdf"
+            ocrEnabled: configuration.ocrEnabled && configuration.format == "pdf",
+            ocrOnly: ocrOnly
         )
     }
 

@@ -189,41 +189,22 @@ public actor StoredScannerSetupService: ScannerSetupServing {
     }
 }
 
-public protocol ScanPreviewProviding: Sendable {
-    func preview(for sourceURL: URL, outputDirectory: URL) async throws -> Data
-}
-
-public struct CompatibleScanPreviewProvider: ScanPreviewProviding {
-    public init() {}
-
-    public func preview(for sourceURL: URL, outputDirectory: URL) async throws -> Data {
-        let previewDirectory = outputDirectory.appendingPathComponent(PreviewOutputName.directoryName, isDirectory: true)
-        let previewURL = previewDirectory.appendingPathComponent("\(sourceURL.lastPathComponent).jpg")
-        let fileManager = FileManager.default
-        if let previewAttributes = try? fileManager.attributesOfItem(atPath: previewURL.path),
-           let sourceAttributes = try? fileManager.attributesOfItem(atPath: sourceURL.path),
-           let previewDate = previewAttributes[.modificationDate] as? Date,
-           let sourceDate = sourceAttributes[.modificationDate] as? Date,
-           previewDate >= sourceDate {
-            return try Data(contentsOf: previewURL)
-        }
-
-        let data = PlaceholderPreview.jpegBytes
-        try fileManager.createDirectory(at: previewDirectory, withIntermediateDirectories: true)
-        try data.write(to: previewURL, options: .atomic)
-        return data
-    }
-}
-
 public struct ScannerServerDependencies: Sendable {
     public let settingsStore: ScanSettingsStore
     public let scannerStore: ScannerConfigStore
     public let scanJobs: ScanJobActor
     public let scanSnapAcquisitionSessions: ScanSnapAcquisitionSessionCoordinator
     public let ocrQueue: OCRQueueActor
+    public let internalOCRWorker: InternalOCRWorkerControl
+    public let ocrWorkerRegistry: OCRWorkerRegistry
+    public let ocrWorkerJobs: OCRWorkerJobStore
+    public let ocrWorkerResultValidator: any OCRWorkerResultValidating
+    public let ocrWorkerTransfers: OCRWorkerJobTransferCoordinator
     public let outputPathResolver: ScanOutputPathResolver
+    public let documentCollection: ScanDocumentCollection
     public let scannerSetup: any ScannerSetupServing
     public let previewProvider: any ScanPreviewProviding
+    public let ocrTextExtractor: any OCRTextExtracting
     public let webUpdates: WebUpdateNotifier
     public let scannerReachability: ScanSnapReachabilityState
     public let environment: [String: String]
@@ -236,9 +217,14 @@ public struct ScannerServerDependencies: Sendable {
         scanJobs: ScanJobActor,
         scanSnapAcquisitionSessions: ScanSnapAcquisitionSessionCoordinator = ScanSnapAcquisitionSessionCoordinator(),
         ocrQueue: OCRQueueActor? = nil,
+        internalOCRWorker: InternalOCRWorkerControl? = nil,
+        ocrWorkerRegistry: OCRWorkerRegistry? = nil,
+        ocrWorkerJobs: OCRWorkerJobStore? = nil,
+        ocrWorkerResultValidator: (any OCRWorkerResultValidating)? = nil,
         outputPathResolver: ScanOutputPathResolver,
         scannerSetup: any ScannerSetupServing,
         previewProvider: any ScanPreviewProviding = CompatibleScanPreviewProvider(),
+        ocrTextExtractor: any OCRTextExtracting = PDFToTextExtractor(),
         webUpdates: WebUpdateNotifier? = nil,
         scannerReachability: ScanSnapReachabilityState? = nil,
         environment: [String: String],
@@ -248,15 +234,97 @@ public struct ScannerServerDependencies: Sendable {
         self.scannerStore = scannerStore ?? ScannerConfigStore(environment: environment)
         self.scanJobs = scanJobs
         self.scanSnapAcquisitionSessions = scanSnapAcquisitionSessions
-        self.ocrQueue = ocrQueue ?? OCRQueueActor(
-            executor: FoundationProcessExecutor(),
-            configuration: OCRQueueConfiguration(environment: environment)
+        let webUpdates = webUpdates ?? scanJobs.webUpdates
+        let queueConfiguration = OCRQueueConfiguration(environment: environment)
+        let internalOCRWorker = internalOCRWorker ?? InternalOCRWorkerControl(
+            fileURL: InternalOCRWorkerControl.defaultFileURL(environment: environment),
+            maximumCPUs: queueConfiguration.cpuLimit,
+            defaultReducedPriority: queueConfiguration.niceLevel != nil,
+            niceLevel: queueConfiguration.niceLevel ?? 10,
+            webUpdates: webUpdates
         )
+        let ocrWorkerRegistry = ocrWorkerRegistry ?? OCRWorkerRegistry(
+            fileURL: OCRWorkerRegistry.defaultFileURL(environment: environment),
+            webUpdates: webUpdates
+        )
+        let ocrWorkerJobs = ocrWorkerJobs ?? OCRWorkerJobStore(
+            fileURL: OCRWorkerJobStore.defaultFileURL(environment: environment)
+        )
+        self.internalOCRWorker = internalOCRWorker
+        let resolvedOCRQueue: OCRQueueActor
+        if let ocrQueue {
+            resolvedOCRQueue = ocrQueue
+        } else {
+            let processExecutor = FoundationProcessExecutor()
+            let distributedConfiguration = DistributedOCRConfiguration(environment: environment)
+            let localCapacity = OCRLocalCapacityPool(
+                capacity: queueConfiguration.cpuLimit,
+                webUpdates: webUpdates
+            )
+            let documentExecutor = NativeDocumentToolExecutor(executor: processExecutor)
+            let ocrExecutor = OCRExecutionModule(
+                local: LocalOCRProcessAdapter(
+                    processExecutor: processExecutor,
+                    documentExecutor: documentExecutor
+                ),
+                workers: ocrWorkerRegistry,
+                jobs: ocrWorkerJobs,
+                internalWorker: internalOCRWorker,
+                localCapacity: localCapacity,
+                configuration: distributedConfiguration
+            )
+            resolvedOCRQueue = OCRQueueActor(
+                ocrExecutor: ocrExecutor,
+                documentExecutor: documentExecutor,
+                configuration: queueConfiguration,
+                localCapacity: localCapacity,
+                workerCapacityProvider: {
+                    let remoteJobSlots = distributedConfiguration.enabled
+                        ? await ocrWorkerRegistry.availableJobCapacity()
+                        : 0
+                    let internalSettings = await internalOCRWorker.settings
+                    return OCRQueueWorkerCapacity(
+                        remoteJobSlots: remoteJobSlots,
+                        internalOCREnabled: !(await internalOCRWorker.isPaused),
+                        internalOCRFallbackOnly: internalSettings.fallbackOnly,
+                        internalCPULimit: internalSettings.cpuLimit,
+                        internalNiceLevel: internalSettings.niceLevel
+                    )
+                },
+                webUpdates: webUpdates
+            )
+        }
+        self.ocrQueue = resolvedOCRQueue
         self.outputPathResolver = outputPathResolver
+        self.documentCollection = ScanDocumentCollection(
+            outputDirectory: outputPathResolver.outputDirectory,
+            previewProvider: previewProvider,
+            workCanceller: ScanDocumentWorkCanceller { path in
+                await resolvedOCRQueue.cancelJobs(referencing: path)
+                if (try? await ocrWorkerJobs.cancelJobs(referencing: path)) ?? 0 > 0 {
+                    await webUpdates.notify()
+                }
+            }
+        )
         self.scannerSetup = scannerSetup
         self.previewProvider = previewProvider
-        let webUpdates = webUpdates ?? scanJobs.webUpdates
+        self.ocrTextExtractor = ocrTextExtractor
         self.webUpdates = webUpdates
+        self.ocrWorkerRegistry = ocrWorkerRegistry
+        self.ocrWorkerJobs = ocrWorkerJobs
+        let ocrWorkerResultValidator = ocrWorkerResultValidator
+            ?? QPDFOCRWorkerResultValidator()
+        self.ocrWorkerResultValidator = ocrWorkerResultValidator
+        self.ocrWorkerTransfers = OCRWorkerJobTransferCoordinator(
+            registry: ocrWorkerRegistry,
+            jobs: ocrWorkerJobs,
+            outputDirectory: outputPathResolver.outputDirectory,
+            resultValidator: ocrWorkerResultValidator,
+            webUpdates: webUpdates,
+            maximumResultBytes: OCRWorkerJobTransferCoordinator.maximumResultBytes(
+                environment: environment
+            )
+        )
         self.scannerReachability = scannerReachability ?? ScanSnapReachabilityState(webUpdates: webUpdates)
         self.environment = environment
         self.buttonConfigurationChanges = buttonConfigurationChanges
@@ -272,9 +340,56 @@ public struct ScannerServerDependencies: Sendable {
         let processExecutor = FoundationProcessExecutor()
         let documentExecutor = NativeDocumentToolExecutor(executor: processExecutor)
         let webUpdates = WebUpdateNotifier()
+        let queueConfiguration = OCRQueueConfiguration(environment: environment)
+        let internalOCRWorker = InternalOCRWorkerControl(
+            fileURL: InternalOCRWorkerControl.defaultFileURL(environment: environment),
+            maximumCPUs: queueConfiguration.cpuLimit,
+            defaultReducedPriority: queueConfiguration.niceLevel != nil,
+            niceLevel: queueConfiguration.niceLevel ?? 10,
+            webUpdates: webUpdates
+        )
+        let ocrWorkerRegistry = OCRWorkerRegistry(
+            fileURL: OCRWorkerRegistry.defaultFileURL(environment: environment),
+            webUpdates: webUpdates
+        )
+        let ocrWorkerJobs = OCRWorkerJobStore(
+            fileURL: OCRWorkerJobStore.defaultFileURL(environment: environment)
+        )
+        let ocrWorkerResultValidator = QPDFOCRWorkerResultValidator(executor: processExecutor)
+        let distributedConfiguration = DistributedOCRConfiguration(environment: environment)
+        let localCapacity = OCRLocalCapacityPool(
+            capacity: queueConfiguration.cpuLimit,
+            webUpdates: webUpdates
+        )
+        let ocrExecutor = OCRExecutionModule(
+            local: LocalOCRProcessAdapter(
+                processExecutor: processExecutor,
+                documentExecutor: documentExecutor
+            ),
+            workers: ocrWorkerRegistry,
+            jobs: ocrWorkerJobs,
+            internalWorker: internalOCRWorker,
+            localCapacity: localCapacity,
+            configuration: distributedConfiguration
+        )
         let ocrQueue = OCRQueueActor(
-            executor: processExecutor,
-            configuration: OCRQueueConfiguration(environment: environment),
+            ocrExecutor: ocrExecutor,
+            documentExecutor: documentExecutor,
+            configuration: queueConfiguration,
+            localCapacity: localCapacity,
+            workerCapacityProvider: {
+                let remoteJobSlots = distributedConfiguration.enabled
+                    ? await ocrWorkerRegistry.availableJobCapacity()
+                    : 0
+                let internalSettings = await internalOCRWorker.settings
+                return OCRQueueWorkerCapacity(
+                    remoteJobSlots: remoteJobSlots,
+                    internalOCREnabled: !(await internalOCRWorker.isPaused),
+                    internalOCRFallbackOnly: internalSettings.fallbackOnly,
+                    internalCPULimit: internalSettings.cpuLimit,
+                    internalNiceLevel: internalSettings.niceLevel
+                )
+            },
             webUpdates: webUpdates
         )
         let settingsStore = ScanSettingsStore(environment: environment)
@@ -288,6 +403,7 @@ public struct ScannerServerDependencies: Sendable {
             scanJobs: ScanJobActor(
                 nativeScanner: NativeScanPipeline(
                     executor: documentExecutor,
+                    ocrQueue: ocrQueue,
                     acquisitionSessions: scanSnapAcquisitionSessions
                 ),
                 ocrQueue: ocrQueue,
@@ -295,6 +411,10 @@ public struct ScannerServerDependencies: Sendable {
             ),
             scanSnapAcquisitionSessions: scanSnapAcquisitionSessions,
             ocrQueue: ocrQueue,
+            internalOCRWorker: internalOCRWorker,
+            ocrWorkerRegistry: ocrWorkerRegistry,
+            ocrWorkerJobs: ocrWorkerJobs,
+            ocrWorkerResultValidator: ocrWorkerResultValidator,
             outputPathResolver: ScanOutputPathResolver(outputDirectory: outputDirectory),
             scannerSetup: ScanSnapSetupService(
                 environment: environment,
@@ -342,33 +462,172 @@ public enum ScannerServerApplication {
         let buildInformation = ScannerServerBuildInformation(environment: dependencies.environment)
         let router = Router()
 
-        router.get("/") { request, _ -> Response in
-            if let issue = ScanDirectoryAccessIssue.check(
-                directory: dependencies.outputPathResolver.outputDirectory
-            ) {
-                return scanDirectoryErrorResponse(
-                    template: indexTemplate,
-                    issue: issue,
-                    buildInformation: buildInformation
+        registerOCRAPIRoutes(router, dependencies: dependencies)
+
+        router.get("/") { request, _ in
+            await webPageResponse(
+                request: request,
+                page: .scan,
+                template: indexTemplate,
+                dependencies: dependencies,
+                buildInformation: buildInformation
+            )
+        }
+        router.get("/documents") { request, _ in
+            await webPageResponse(
+                request: request,
+                page: .documents,
+                template: indexTemplate,
+                dependencies: dependencies,
+                buildInformation: buildInformation
+            )
+        }
+        router.get("/documents/updates") { request, _ -> Response in
+            let value = queryValues(request.uri.query)["since"] ?? ""
+            guard let since = UInt64(value) else {
+                return textResponse("Invalid revision\n", status: .badRequest)
+            }
+
+            let revision = await dependencies.webUpdates.wait(after: since)
+            let localTime = ScannerServerLocalTime(environment: dependencies.environment)
+            let groups = await dependencies.documentCollection.groups(timeZone: localTime.timeZone)
+            return jsonResponse(
+                DocumentsUpdateResponse(
+                    revision: revision,
+                    html: renderDocumentResults(groups)
+                )
+            )
+        }
+        router.post("/documents/import") { request, context -> Response in
+            guard request.headers[.contentType]?.lowercased().hasPrefix("application/pdf") == true else {
+                return textResponse("Only PDF uploads are supported.\n", status: .unsupportedMediaType)
+            }
+            let query = queryValues(request.uri.query)
+            guard let encodedName = query["filename64"],
+                  let requestedName = decodeURLSafeBase64(encodedName) else {
+                return textResponse("Missing PDF filename.\n", status: .badRequest)
+            }
+
+            let fileName: ScanOutputFileName
+            do {
+                fileName = try importedPDFFileName(requestedName)
+            } catch {
+                return textResponse("Invalid PDF filename.\n", status: .badRequest)
+            }
+
+            let outputDirectory = dependencies.outputPathResolver.outputDirectory
+            let inputURL = outputDirectory.appendingPathComponent(fileName.rawValue, isDirectory: false)
+            let outputPath = OCRInputPath.outputPath(for: inputURL.path)!
+            guard !FileManager.default.fileExists(atPath: inputURL.path),
+                  !FileManager.default.fileExists(atPath: outputPath) else {
+                return textResponse("A source or OCR file with that name already exists.\n", status: .conflict)
+            }
+
+            let settings = try await dependencies.settingsStore.load()
+            let mode: ScanMode
+            if let modeID = query["mode_id"] {
+                guard let selected = settings.mode(id: modeID) else {
+                    return textResponse("Unknown OCR preset.\n", status: .badRequest)
+                }
+                mode = selected
+            } else {
+                mode = settings.defaultMode
+            }
+
+            let data: Data
+            do {
+                let buffer = try await request.body.collect(
+                    upTo: pdfImportUploadLimit(environment: dependencies.environment)
+                )
+                data = Data(buffer.readableBytesView)
+            } catch {
+                return textResponse(
+                    "PDF upload is too large.\n",
+                    status: HTTPResponse.Status(code: 413, reasonPhrase: "Content Too Large")
                 )
             }
+            guard data.count >= 5, data.prefix(5) == Data("%PDF-".utf8) else {
+                return textResponse("Uploaded data is not a PDF.\n", status: .unsupportedMediaType)
+            }
+
+            let stagingURL = outputDirectory.appendingPathComponent(
+                ".pdf-import.\(UUID().uuidString)",
+                isDirectory: false
+            )
+            defer { try? FileManager.default.removeItem(at: stagingURL) }
             do {
-                return try await indexResponse(
-                    request: request,
-                    template: indexTemplate,
-                    dependencies: dependencies,
-                    buildInformation: buildInformation
+                try data.write(to: stagingURL, options: .atomic)
+                try FoundationNativeScanFileSystem().placeFileExclusively(
+                    at: stagingURL,
+                    destination: inputURL
                 )
             } catch {
-                return scanDirectoryErrorResponse(
-                    template: indexTemplate,
-                    issue: ScanDirectoryAccessIssue(
-                        directoryPath: dependencies.outputPathResolver.outputDirectory.path,
-                        details: error.localizedDescription
-                    ),
-                    buildInformation: buildInformation
+                return textResponse("Could not store PDF without overwriting a file.\n", status: .conflict)
+            }
+
+            var environment = dependencies.environment
+            environment.merge(settings.environment(for: mode, trigger: "pdf-import")) {
+                _, selected in selected
+            }
+            environment["SCAN_FORMAT"] = "pdf"
+            environment["SCAN_PAGE_MODE"] = "multi"
+            environment["SCAN_OCR_ENABLED"] = "true"
+            let workDirectory = outputDirectory.appendingPathComponent(
+                ".pdf-import-work.\(UUID().uuidString)",
+                isDirectory: true
+            )
+            let pageCount: Int
+            do {
+                pageCount = try await dependencies.ocrQueue.enqueueImportedPDF(
+                    ImportedPDFOCRRequest(
+                        sourcePath: inputURL.path,
+                        documentName: fileName.rawValue,
+                        finalOutputPath: outputPath,
+                        workDirectory: workDirectory,
+                        environment: environment,
+                        removeBlankPages: mode.settings.removeBlankPages,
+                        cropPages: mode.settings.cropPages
+                    )
+                )
+            } catch {
+                try? FileManager.default.removeItem(at: inputURL)
+                return textResponse(
+                    "Could not prepare PDF for OCR: \(error.localizedDescription)\n",
+                    status: HTTPResponse.Status(code: 422, reasonPhrase: "Unprocessable Content")
                 )
             }
+            await dependencies.webUpdates.notify()
+            return jsonResponse(
+                PDFImportResponse(filename: fileName.rawValue, pages: pageCount),
+                status: .accepted
+            )
+        }
+        router.get("/presets") { request, _ in
+            await webPageResponse(
+                request: request,
+                page: .presets,
+                template: indexTemplate,
+                dependencies: dependencies,
+                buildInformation: buildInformation
+            )
+        }
+        router.get("/settings") { request, _ in
+            await webPageResponse(
+                request: request,
+                page: .settings,
+                template: indexTemplate,
+                dependencies: dependencies,
+                buildInformation: buildInformation
+            )
+        }
+        router.get("/workers") { request, _ in
+            await webPageResponse(
+                request: request,
+                page: .workers,
+                template: indexTemplate,
+                dependencies: dependencies,
+                buildInformation: buildInformation
+            )
         }
         router.get("/health") { _, _ in "ok\n" }
         router.get("/version") { _, _ in "\(buildInformation.version)\n" }
@@ -392,27 +651,265 @@ public enum ScannerServerApplication {
             let setup = await dependencies.scannerSetup.state()
             let wifiBackend = dependencies.environment["SCAN_BACKEND", default: "wifi"] == "wifi"
             guard !wifiBackend || setup.configured else {
-                return redirect(setup: .setupRequired)
+                return redirect(setup: .setupRequired, to: "/settings")
             }
 
             var environment = dependencies.environment
             environment.merge(setup.scannerEnvironment) { _, configured in configured }
             let configuration = ScanPipelineConfiguration(
                 environment: environment,
-                modeOverrides: mode.environment(trigger: "web")
+                modeOverrides: settings.environment(for: mode, trigger: "web")
             )
             _ = await dependencies.scanJobs.start(configuration: configuration)
+            return .redirect(to: "/")
+        }
+        router.post("/scan/cancel") { _, _ -> Response in
+            await dependencies.scanJobs.cancel()
             return .redirect(to: "/")
         }
         router.post("/ocr/cancel") { _, _ -> Response in
             await dependencies.ocrQueue.cancelAll()
             return .redirect(to: "/")
         }
+        router.post("/internal-worker/pause") { _, _ -> Response in
+            try? await dependencies.internalOCRWorker.setPaused(true)
+            await dependencies.ocrQueue.capacityDidChange()
+            return .redirect(to: "/workers")
+        }
+        router.post("/internal-worker/resume") { _, _ -> Response in
+            try? await dependencies.internalOCRWorker.setPaused(false)
+            await dependencies.ocrQueue.capacityDidChange()
+            return .redirect(to: "/workers")
+        }
+        router.post("/internal-worker/settings") { request, context -> Response in
+            let form = try await decodeForm(
+                InternalWorkerSettingsForm.self,
+                request: request,
+                context: context
+            )
+            let cpuLimit = form.cpuLimit.flatMap { value -> Int? in
+                let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                return value.isEmpty ? nil : Int(value)
+            }
+            let priority = form.priority.flatMap(InternalOCRWorkerPriority.init(rawValue:))
+                ?? (form.reducedPriority == "true" ? .niced : .normal)
+            try await dependencies.internalOCRWorker.setSettings(
+                cpuLimit: cpuLimit,
+                priority: priority
+            )
+            await dependencies.ocrQueue.capacityDidChange()
+            return .redirect(to: "/workers")
+        }
+
+        router.get("/api/ocr-workers") { _, _ -> Response in
+            jsonResponse(await dependencies.ocrWorkerRegistry.snapshots())
+        }
+        router.post("/api/ocr-workers/register") { request, context -> Response in
+            do {
+                let registration = try await decodeJSON(
+                    OCRWorkerRegistrationRequest.self,
+                    request: request,
+                    context: context
+                )
+                let response = try await dependencies.ocrWorkerRegistry.register(registration)
+                await dependencies.ocrQueue.capacityDidChange()
+                return jsonResponse(response)
+            } catch {
+                return workerAPIErrorResponse(error)
+            }
+        }
+        router.post("/api/ocr-workers/:id/heartbeat") { request, context -> Response in
+            guard let workerID = workerID(context: context) else {
+                return textResponse("Missing worker ID\n", status: .badRequest)
+            }
+            do {
+                let heartbeat = try await decodeJSON(
+                    OCRWorkerHeartbeatRequest.self,
+                    request: request,
+                    context: context
+                )
+                let response = try await dependencies.ocrWorkerRegistry.heartbeat(
+                    workerID: workerID,
+                    request: heartbeat
+                )
+                await dependencies.ocrQueue.capacityDidChange()
+                return jsonResponse(response)
+            } catch {
+                return workerAPIErrorResponse(error)
+            }
+        }
+        router.post("/api/ocr-workers/:id/jobs/lease") { request, context -> Response in
+            guard let workerID = workerID(context: context) else {
+                return textResponse("Missing worker ID\n", status: .badRequest)
+            }
+            do {
+                let poll = try await decodeJSON(
+                    OCRWorkerJobPollRequest.self,
+                    request: request,
+                    context: context
+                )
+                if let lease = try await dependencies.ocrWorkerTransfers.leaseNext(
+                    workerID: workerID,
+                    request: poll
+                ) {
+                    return jsonResponse(lease)
+                }
+                return Response(status: .noContent)
+            } catch {
+                return workerAPIErrorResponse(error)
+            }
+        }
+        router.get("/api/ocr-workers/:id/jobs/:job/source") { request, context -> Response in
+            guard let workerID = workerID(context: context),
+                  let jobID = workerJobID(context: context),
+                  let authenticationToken = bearerToken(request),
+                  let leaseToken = request.headers[.ifMatch] else {
+                return jsonResponse(
+                    WorkerAPIError(error: "Missing worker or lease authentication."),
+                    status: .unauthorized
+                )
+            }
+            do {
+                let source = try await dependencies.ocrWorkerTransfers.source(
+                    workerID: workerID,
+                    authenticationToken: authenticationToken,
+                    jobID: jobID,
+                    leaseToken: leaseToken
+                )
+                return dataResponse(
+                    source.data,
+                    contentType: "application/pdf",
+                    additionalHeaders: [
+                        .contentDisposition: "attachment; filename=source.pdf",
+                        .eTag: source.sha256,
+                    ]
+                )
+            } catch {
+                return workerAPIErrorResponse(error)
+            }
+        }
+        router.post("/api/ocr-workers/:id/jobs/:job/renew") { request, context -> Response in
+            guard let workerID = workerID(context: context),
+                  let jobID = workerJobID(context: context) else {
+                return textResponse("Missing worker or job ID\n", status: .badRequest)
+            }
+            do {
+                let renewal = try await decodeJSON(
+                    OCRWorkerJobLeaseRequest.self,
+                    request: request,
+                    context: context
+                )
+                return jsonResponse(try await dependencies.ocrWorkerTransfers.renew(
+                    workerID: workerID,
+                    jobID: jobID,
+                    request: renewal
+                ))
+            } catch {
+                return workerAPIErrorResponse(error)
+            }
+        }
+        router.post("/api/ocr-workers/:id/jobs/:job/fail") { request, context -> Response in
+            guard let workerID = workerID(context: context),
+                  let jobID = workerJobID(context: context) else {
+                return textResponse("Missing worker or job ID\n", status: .badRequest)
+            }
+            do {
+                let failure = try await decodeJSON(
+                    OCRWorkerJobFailureRequest.self,
+                    request: request,
+                    context: context
+                )
+                let snapshot = try await dependencies.ocrWorkerTransfers.reportFailure(
+                    workerID: workerID,
+                    jobID: jobID,
+                    request: failure
+                )
+                return jsonResponse(snapshot)
+            } catch {
+                return workerAPIErrorResponse(error)
+            }
+        }
+        router.post("/api/ocr-workers/:id/jobs/:job/result") { request, context -> Response in
+            guard let workerID = workerID(context: context),
+                  let jobID = workerJobID(context: context),
+                  let authenticationToken = bearerToken(request),
+                  let leaseToken = request.headers[.ifMatch] else {
+                return jsonResponse(
+                    WorkerAPIError(error: "Missing worker or lease authentication."),
+                    status: .unauthorized
+                )
+            }
+            do {
+                try await dependencies.ocrWorkerTransfers.authorizeResult(
+                    workerID: workerID,
+                    authenticationToken: authenticationToken,
+                    jobID: jobID,
+                    leaseToken: leaseToken
+                )
+                let buffer = try await request.body.collect(
+                    upTo: dependencies.ocrWorkerTransfers.maximumResultBytes
+                )
+                let data = Data(buffer.readableBytesView)
+                return jsonResponse(try await dependencies.ocrWorkerTransfers.acceptResult(
+                    workerID: workerID,
+                    authenticationToken: authenticationToken,
+                    jobID: jobID,
+                    leaseToken: leaseToken,
+                    data: data
+                ))
+            } catch {
+                return workerAPIErrorResponse(error)
+            }
+        }
+        router.post("/workers/:id/approve") { _, context -> Response in
+            if let workerID = workerID(context: context) {
+                _ = try? await dependencies.ocrWorkerRegistry.approve(workerID: workerID)
+                await dependencies.ocrQueue.capacityDidChange()
+            }
+            return .redirect(to: "/workers")
+        }
+        router.post("/workers/:id/enable") { _, context -> Response in
+            if let workerID = workerID(context: context) {
+                _ = try? await dependencies.ocrWorkerRegistry.setEnabled(true, workerID: workerID)
+                await dependencies.ocrQueue.capacityDidChange()
+            }
+            return .redirect(to: "/workers")
+        }
+        router.post("/workers/:id/disable") { _, context -> Response in
+            if let workerID = workerID(context: context) {
+                _ = try? await dependencies.ocrWorkerRegistry.setEnabled(false, workerID: workerID)
+                await dependencies.ocrQueue.capacityDidChange()
+            }
+            return .redirect(to: "/workers")
+        }
+        router.post("/workers/:id/pause") { _, context -> Response in
+            if let workerID = workerID(context: context),
+               (try? await dependencies.ocrWorkerRegistry.setPaused(true, workerID: workerID)) != nil {
+                _ = try? await dependencies.ocrWorkerJobs.requeueLeases(workerID: workerID)
+                await dependencies.webUpdates.notify()
+                await dependencies.ocrQueue.capacityDidChange()
+            }
+            return .redirect(to: "/workers")
+        }
+        router.post("/workers/:id/resume") { _, context -> Response in
+            if let workerID = workerID(context: context) {
+                _ = try? await dependencies.ocrWorkerRegistry.setPaused(false, workerID: workerID)
+                await dependencies.ocrQueue.capacityDidChange()
+            }
+            return .redirect(to: "/workers")
+        }
+        router.post("/workers/:id/delete") { _, context -> Response in
+            if let workerID = workerID(context: context) {
+                _ = try? await dependencies.ocrWorkerRegistry.remove(workerID: workerID)
+                await dependencies.ocrQueue.capacityDidChange()
+            }
+            return .redirect(to: "/workers")
+        }
 
         router.post("/modes/default") { request, context -> Response in
             let form = try await decodeForm(ModeIDForm.self, request: request, context: context)
             try await dependencies.settingsStore.setDefaultMode(id: form.modeID)
-            return .redirect(to: "/")
+            return .redirect(to: "/presets")
         }
 
         router.post("/modes/save") { request, context -> Response in
@@ -424,17 +921,34 @@ public enum ScannerServerApplication {
                 existingID: form.modeID,
                 setDefault: form.setDefault != nil
             )
-            return .redirect(to: "/?edit_mode=\(urlQueryValue(modeID))")
+            return .redirect(to: "/presets?edit_mode=\(urlQueryValue(modeID))")
         }
 
         router.post("/modes/delete") { request, context -> Response in
             let form = try await decodeForm(ModeIDForm.self, request: request, context: context)
             try await dependencies.settingsStore.deleteMode(id: form.modeID)
-            return .redirect(to: "/")
+            return .redirect(to: "/presets")
+        }
+
+        router.post("/presets/blank-pages") { request, context -> Response in
+            let form = try await decodeForm(
+                BlankPageSettingsForm.self,
+                request: request,
+                context: context
+            )
+            guard let blankPageSettings = form.blankPageSettings else {
+                return textResponse(
+                    "Invalid blank-page thresholds.\n",
+                    status: .badRequest
+                )
+            }
+            try await dependencies.settingsStore.saveBlankPageSettings(blankPageSettings)
+            await dependencies.webUpdates.notify()
+            return .redirect(to: "/presets?blank_pages=saved")
         }
 
         router.post("/setup/scanners/discover") { _, _ -> Response in
-            redirect(setup: await dependencies.scannerSetup.discover())
+            redirect(setup: await dependencies.scannerSetup.discover(), to: "/settings")
         }
         router.get("/setup/scanners/state") { _, _ -> Response in
             await dependencies.scannerSetup.ensureDiscoveryStarted()
@@ -456,9 +970,9 @@ public enum ScannerServerApplication {
         router.post("/setup/scanners/select") { request, context -> Response in
             let form = try await decodeForm(ScannerSelectForm.self, request: request, context: context)
             guard let deviceID = form.deviceID, !deviceID.isEmpty else {
-                return redirect(setup: .noDevice)
+                return redirect(setup: .noDevice, to: "/settings")
             }
-            return redirect(setup: await dependencies.scannerSetup.select(deviceID: deviceID))
+            return redirect(setup: await dependencies.scannerSetup.select(deviceID: deviceID), to: "/settings")
         }
         router.post("/setup/scanners/manual") { request, context -> Response in
             let form = try await decodeForm(ScannerManualForm.self, request: request, context: context)
@@ -466,35 +980,41 @@ public enum ScannerServerApplication {
             let credential = form.scannerCredential ?? ""
             guard !ipAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   !credential.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                return Response.redirect(to: "/?setup=manual-missing")
+                return Response.redirect(to: "/settings?setup=manual-missing")
             }
             return redirect(
                 setup: await dependencies.scannerSetup.configureManually(
                     ipAddress: ipAddress,
                     credential: credential
-                )
+                ),
+                to: "/settings"
             )
         }
         router.post("/setup/scanners/clear") { _, _ -> Response in
-            redirect(setup: await dependencies.scannerSetup.clear())
+            redirect(setup: await dependencies.scannerSetup.clear(), to: "/settings")
         }
 
         router.get("/files/:name/preview") { _, context -> Response in
-            guard let sourceURL = resolvedFile(context: context, dependencies: dependencies),
-                  ["pdf", "png"].contains(sourceURL.pathExtension.lowercased()) else {
+            guard let name = routeName(context: context),
+                  let data = try await dependencies.documentCollection.preview(named: name)
+            else {
                 return textResponse("Not found", status: .notFound)
             }
-            let data = try await dependencies.previewProvider.preview(
-                for: sourceURL,
-                outputDirectory: dependencies.outputPathResolver.outputDirectory
-            )
             return dataResponse(data, contentType: "image/jpeg")
         }
         router.get("/files/:name") { _, context -> Response in
-            fileResponse(context: context, dependencies: dependencies, disposition: "attachment")
+            await fileResponse(
+                context: context,
+                dependencies: dependencies,
+                disposition: "attachment"
+            )
         }
         router.get("/view/:name") { _, context -> Response in
-            fileResponse(context: context, dependencies: dependencies, disposition: "inline")
+            await fileResponse(
+                context: context,
+                dependencies: dependencies,
+                disposition: "inline"
+            )
         }
         router.post("/files/delete-selected") { request, context -> Response in
             let names = try await decodeRepeatedFormValue(
@@ -505,13 +1025,13 @@ public enum ScannerServerApplication {
             for name in names {
                 await deleteFile(name: name, dependencies: dependencies)
             }
-            return .redirect(to: "/")
+            return .redirect(to: "/documents")
         }
         router.post("/files/:name/delete") { _, context -> Response in
             if let name = routeName(context: context) {
                 await deleteFile(name: name, dependencies: dependencies)
             }
-            return .redirect(to: "/")
+            return .redirect(to: "/documents")
         }
 
         return router
@@ -521,6 +1041,18 @@ public enum ScannerServerApplication {
 private struct ModeIDForm: Decodable {
     let modeID: String?
     enum CodingKeys: String, CodingKey { case modeID = "mode_id" }
+}
+
+private struct InternalWorkerSettingsForm: Decodable {
+    let cpuLimit: String?
+    let priority: String?
+    let reducedPriority: String?
+
+    enum CodingKeys: String, CodingKey {
+        case cpuLimit = "cpu_limit"
+        case priority
+        case reducedPriority = "reduced_priority"
+    }
 }
 
 private struct ModeSaveForm: Decodable {
@@ -534,11 +1066,10 @@ private struct ModeSaveForm: Decodable {
     let format: String?
     let pageMode: String?
     let ocrEnabled: String?
-    let ocrCPULimit: String?
-    let ocrNice: String?
     let removeBlankPages: String?
     let cropPages: String?
     let cropMarginPoints: String?
+    let ocrOnly: String?
     let setDefault: String?
 
     enum CodingKeys: String, CodingKey {
@@ -552,11 +1083,10 @@ private struct ModeSaveForm: Decodable {
         case format = "SCAN_FORMAT"
         case pageMode = "SCAN_PAGE_MODE"
         case ocrEnabled = "SCAN_OCR_ENABLED"
-        case ocrCPULimit = "SCAN_OCR_CPU_LIMIT"
-        case ocrNice = "SCAN_OCR_NICE"
         case removeBlankPages = "SCAN_REMOVE_BLANK_PAGES"
         case cropPages = "SCAN_CROP_PAGES"
         case cropMarginPoints = "SCAN_CROP_MARGIN_POINTS"
+        case ocrOnly = "SCAN_OCR_ONLY"
         case setDefault = "set_default"
     }
 
@@ -571,12 +1101,37 @@ private struct ModeSaveForm: Decodable {
             "SCAN_FORMAT": format ?? "pdf",
             "SCAN_PAGE_MODE": pageMode ?? "multi",
             "SCAN_OCR_ENABLED": ocrEnabled == nil ? "false" : "true",
-            "SCAN_OCR_CPU_LIMIT": ocrCPULimit ?? "",
-            "SCAN_OCR_NICE": ocrNice ?? "false",
             "SCAN_REMOVE_BLANK_PAGES": removeBlankPages == nil ? "false" : "true",
             "SCAN_CROP_PAGES": cropPages == nil ? "false" : "true",
             "SCAN_CROP_MARGIN_POINTS": cropMarginPoints ?? "",
+            "SCAN_OCR_ONLY": ocrOnly == nil ? "false" : "true",
         ])
+    }
+}
+
+private struct BlankPageSettingsForm: Decodable {
+    let whiteThreshold: String?
+    let contentRatioThreshold: String?
+    let meanThreshold: String?
+
+    enum CodingKeys: String, CodingKey {
+        case whiteThreshold = "SCAN_BLANK_WHITE_THRESHOLD"
+        case contentRatioThreshold = "SCAN_BLANK_CONTENT_RATIO_THRESHOLD"
+        case meanThreshold = "SCAN_BLANK_MEAN_THRESHOLD"
+    }
+
+    var blankPageSettings: BlankPageSettings? {
+        guard let whiteThreshold = whiteThreshold.flatMap(Int.init),
+              let contentRatioThreshold = contentRatioThreshold.flatMap(Double.init),
+              let meanThreshold = meanThreshold.flatMap(Double.init)
+        else {
+            return nil
+        }
+        return BlankPageSettings(
+            validatingWhiteThreshold: whiteThreshold,
+            contentRatioThreshold: contentRatioThreshold,
+            meanThreshold: meanThreshold
+        )
     }
 }
 
@@ -594,12 +1149,62 @@ private struct ScannerManualForm: Decodable {
     }
 }
 
+private struct PDFImportResponse: Encodable {
+    let filename: String
+    let pages: Int
+}
+
+private func importedPDFFileName(_ requestedName: String) throws -> ScanOutputFileName {
+    let validated = try ScanOutputFileName(rawValue: requestedName)
+    guard URL(fileURLWithPath: validated.rawValue).pathExtension.lowercased() == "pdf",
+          !validated.rawValue.lowercased().hasSuffix(".ocr.pdf") else {
+        throw ScanOutputFileNameError.unsupportedExtension(
+            URL(fileURLWithPath: validated.rawValue).pathExtension
+        )
+    }
+    let stem = String(validated.rawValue.dropLast(4))
+    guard !stem.isEmpty else {
+        throw ScanOutputFileNameError.invalidComponent(requestedName)
+    }
+    return try ScanOutputFileName(rawValue: "\(stem).pdf")
+}
+
+private func pdfImportUploadLimit(environment: [String: String]) -> Int {
+    let defaultLimit = 1_073_741_824
+    guard let value = environment["SCAN_PDF_UPLOAD_MAX_BYTES"],
+          let parsed = Int(value.trimmingCharacters(in: .whitespacesAndNewlines)),
+          parsed > 0 else {
+        return defaultLimit
+    }
+    return parsed
+}
+
+private func decodeURLSafeBase64(_ value: String) -> String? {
+    var base64 = value.replacingOccurrences(of: "-", with: "+")
+        .replacingOccurrences(of: "_", with: "/")
+    let remainder = base64.count % 4
+    if remainder != 0 {
+        base64 += String(repeating: "=", count: 4 - remainder)
+    }
+    guard let data = Data(base64Encoded: base64) else { return nil }
+    return String(data: data, encoding: .utf8)
+}
+
 private func decodeForm<Form: Decodable>(
     _ type: Form.Type,
     request: Request,
     context: some RequestContext
 ) async throws -> Form {
     try await URLEncodedFormDecoder().decode(type, from: request, context: context)
+}
+
+private func decodeJSON<Value: Decodable>(
+    _ type: Value.Type,
+    request: Request,
+    context: some RequestContext
+) async throws -> Value {
+    let buffer = try await request.body.collect(upTo: context.maxUploadSize)
+    return try JSONDecoder().decode(type, from: Data(buffer.readableBytesView))
 }
 
 private func decodeRepeatedFormValue(
@@ -613,54 +1218,51 @@ private func decodeRepeatedFormValue(
     return components.queryItems?.filter { $0.name == name }.compactMap(\.value) ?? []
 }
 
-private func redirect(setup outcome: ScannerSetupOutcome) -> Response {
-    .redirect(to: "/?setup=\(outcome.rawValue)")
+private func redirect(setup outcome: ScannerSetupOutcome, to path: String = "/") -> Response {
+    .redirect(to: "\(path)?setup=\(outcome.rawValue)")
 }
 
 private func routeName(context: some RequestContext) -> String? {
     context.parameters.get("name")?.removingPercentEncoding
 }
 
-private func resolvedFile(
-    context: some RequestContext,
-    dependencies: ScannerServerDependencies
-) -> URL? {
-    guard let name = routeName(context: context) else { return nil }
-    return try? dependencies.outputPathResolver.resolve(name)
+private func workerID(context: some RequestContext) -> String? {
+    context.parameters.get("id")?.removingPercentEncoding
+}
+
+private func workerJobID(context: some RequestContext) -> String? {
+    context.parameters.get("job")?.removingPercentEncoding
+}
+
+private func bearerToken(_ request: Request) -> String? {
+    guard let authorization = request.headers[.authorization],
+          authorization.lowercased().hasPrefix("bearer ") else { return nil }
+    let token = authorization.dropFirst("bearer ".count)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return token.isEmpty ? nil : token
 }
 
 private func fileResponse(
     context: some RequestContext,
     dependencies: ScannerServerDependencies,
     disposition: String
-) -> Response {
-    guard let fileURL = resolvedFile(context: context, dependencies: dependencies),
-          let data = try? Data(contentsOf: fileURL) else {
+) async -> Response {
+    guard let name = routeName(context: context),
+          let resource = await dependencies.documentCollection.resource(named: name)
+    else {
         return textResponse("Not found", status: .notFound)
     }
     return dataResponse(
-        data,
-        contentType: mediaType(for: fileURL),
-        additionalHeaders: [.contentDisposition: "\(disposition); filename=\(fileURL.lastPathComponent)"]
+        resource.data,
+        contentType: resource.contentType,
+        additionalHeaders: [
+            .contentDisposition: "\(disposition); filename=\(resource.fileName.rawValue)"
+        ]
     )
 }
 
 private func deleteFile(name: String, dependencies: ScannerServerDependencies) async {
-    guard let fileURL = try? dependencies.outputPathResolver.resolve(name) else { return }
-    await dependencies.ocrQueue.cancelJobs(referencing: fileURL.path)
-    let previewURL = dependencies.outputPathResolver.outputDirectory
-        .appendingPathComponent(PreviewOutputName.directoryName, isDirectory: true)
-        .appendingPathComponent("\(fileURL.lastPathComponent).jpg")
-    try? FileManager.default.removeItem(at: previewURL)
-    try? FileManager.default.removeItem(at: fileURL)
-}
-
-private func mediaType(for url: URL) -> String {
-    switch url.pathExtension.lowercased() {
-    case "pdf": "application/pdf"
-    case "png": "image/png"
-    default: "application/octet-stream"
-    }
+    await dependencies.documentCollection.remove(named: name)
 }
 
 private func dataResponse(
@@ -678,6 +1280,46 @@ private func dataResponse(
 
 private func textResponse(_ text: String, status: HTTPResponse.Status) -> Response {
     dataResponse(Data(text.utf8), status: status, contentType: "text/plain; charset=utf-8")
+}
+
+private struct WorkerAPIError: Encodable {
+    let error: String
+}
+
+private func jsonResponse<Value: Encodable>(
+    _ value: Value,
+    status: HTTPResponse.Status = .ok
+) -> Response {
+    do {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return dataResponse(
+            try encoder.encode(value),
+            status: status,
+            contentType: "application/json; charset=utf-8",
+            additionalHeaders: [.cacheControl: "no-store"]
+        )
+    } catch {
+        return textResponse("Could not encode response\n", status: .internalServerError)
+    }
+}
+
+private func workerAPIErrorResponse(_ error: any Error) -> Response {
+    let status: HTTPResponse.Status
+    if let registryError = error as? OCRWorkerRegistryError,
+       registryError == .authenticationFailed {
+        status = .unauthorized
+    } else if error is OCRWorkerJobStoreError
+        || error is OCRWorkerTransferError
+        || error is OCRWorkerResultValidationError {
+        status = .conflict
+    } else {
+        status = .badRequest
+    }
+    return jsonResponse(
+        WorkerAPIError(error: error.localizedDescription),
+        status: status
+    )
 }
 
 private func scanDirectoryErrorResponse(
@@ -711,8 +1353,73 @@ private func scanDirectoryErrorResponse(
     )
 }
 
+private enum ScannerServerPage: String, CaseIterable {
+    case scan
+    case documents
+    case presets
+    case workers
+    case settings
+
+    var path: String {
+        switch self {
+        case .scan: "/"
+        default: "/\(rawValue)"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .presets: "Scan Settings"
+        case .settings: "Network Setup"
+        default: rawValue.capitalized
+        }
+    }
+}
+
+private struct DocumentsUpdateResponse: Encodable {
+    let revision: UInt64
+    let html: String
+}
+
+private func webPageResponse(
+    request: Request,
+    page: ScannerServerPage,
+    template: String,
+    dependencies: ScannerServerDependencies,
+    buildInformation: ScannerServerBuildInformation
+) async -> Response {
+    if let issue = ScanDirectoryAccessIssue.check(
+        directory: dependencies.outputPathResolver.outputDirectory
+    ) {
+        return scanDirectoryErrorResponse(
+            template: template,
+            issue: issue,
+            buildInformation: buildInformation
+        )
+    }
+    do {
+        return try await indexResponse(
+            request: request,
+            page: page,
+            template: template,
+            dependencies: dependencies,
+            buildInformation: buildInformation
+        )
+    } catch {
+        return scanDirectoryErrorResponse(
+            template: template,
+            issue: ScanDirectoryAccessIssue(
+                directoryPath: dependencies.outputPathResolver.outputDirectory.path,
+                details: error.localizedDescription
+            ),
+            buildInformation: buildInformation
+        )
+    }
+}
+
 private func indexResponse(
     request: Request,
+    page: ScannerServerPage,
     template: String,
     dependencies: ScannerServerDependencies,
     buildInformation: ScannerServerBuildInformation
@@ -728,24 +1435,31 @@ private func indexResponse(
     let settings = try await dependencies.settingsStore.load()
     let job = await dependencies.scanJobs.state
     let ocr = await dependencies.ocrQueue.state
+    let internalWorkerPaused = await dependencies.internalOCRWorker.isPaused
+    let internalWorkerSettings = await dependencies.internalOCRWorker.settings
+    let workers = await dependencies.ocrWorkerRegistry.snapshots()
+    let workerJobs = await dependencies.ocrWorkerJobs.snapshots()
     let setup = await dependencies.scannerSetup.state()
     let scannerIsReachable = await dependencies.scannerReachability.isReachable
     let localTime = ScannerServerLocalTime(environment: dependencies.environment)
     let query = queryValues(request.uri.query)
     let webRevision = await dependencies.webUpdates.currentRevision
-    let groups = scanFileGroups(
-        outputDirectory: dependencies.outputPathResolver.outputDirectory,
-        timeZone: localTime.timeZone
-    )
+    let groups = await dependencies.documentCollection.groups(timeZone: localTime.timeZone)
     let content = renderIndexContent(
+        page: page,
         settings: settings,
         editModeID: query["edit_mode"],
         setupMessageCode: query["setup"],
+        blankPageMessageCode: query["blank_pages"],
         setup: setup,
         scannerIsReachable: scannerIsReachable,
         wifiBackend: wifiBackend,
         job: job,
         ocr: ocr,
+        internalWorkerPaused: internalWorkerPaused,
+        internalWorkerSettings: internalWorkerSettings,
+        workers: workers,
+        workerJobs: workerJobs,
         groups: groups,
         localTime: localTime
     )
@@ -760,31 +1474,21 @@ private func indexResponse(
     return dataResponse(Data(html.utf8), contentType: "text/html; charset=utf-8")
 }
 
-private func scanFileGroups(outputDirectory: URL, timeZone: TimeZone) -> [ScanDayGroup] {
-    guard let urls = try? FileManager.default.contentsOfDirectory(
-        at: outputDirectory,
-        includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
-        options: [.skipsHiddenFiles]
-    ) else { return [] }
-
-    let files = urls.compactMap { url -> ScanFile? in
-        guard let name = try? ScanOutputFileName(rawValue: url.lastPathComponent),
-              let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
-              values.isRegularFile == true else { return nil }
-        return ScanFile(name: name, modificationDate: values.contentModificationDate ?? .distantPast)
-    }
-    return ScanFileGrouping.groups(for: files, timeZone: timeZone)
-}
-
 private func renderIndexContent(
+    page: ScannerServerPage,
     settings: ScanSettings,
     editModeID: String?,
     setupMessageCode: String?,
+    blankPageMessageCode: String?,
     setup: ScannerSetupState,
     scannerIsReachable: Bool,
     wifiBackend: Bool,
     job: ScanJobState,
     ocr: OCRQueueState,
+    internalWorkerPaused: Bool,
+    internalWorkerSettings: InternalOCRWorkerSettings,
+    workers: [OCRWorkerSnapshot],
+    workerJobs: [OCRWorkerJobSnapshot],
     groups: [ScanDayGroup],
     localTime: ScannerServerLocalTime
 ) -> String {
@@ -795,9 +1499,12 @@ private func renderIndexContent(
         selectedMode = editModeID.flatMap(settings.mode(id:)) ?? settings.defaultMode
     }
 
-    var html = ""
+    var html = renderNavigation(active: page)
     if let message = setupMessage(setupMessageCode) {
         html += "<p class=\"notice\">\(htmlEscape(message))</p>"
+    }
+    if page == .presets && blankPageMessageCode == "saved" {
+        html += "<p class=\"notice\">Blank-page thresholds saved.</p>"
     }
     if wifiBackend && setup.configured {
         html += renderScannerReachabilitySummary(
@@ -805,33 +1512,443 @@ private func renderIndexContent(
             scannerIsReachable: scannerIsReachable
         )
     }
-    if wifiBackend && !setup.configured {
-        html += renderScannerSetup(setup)
-    }
-
-    if !wifiBackend || setup.configured {
-        html += "<section><h2>Scan</h2><form method=\"post\" action=\"/scan\">"
-        html += "<label>Scan mode<select name=\"mode_id\">"
-        for mode in settings.modes {
-            let selected = mode.id == settings.defaultModeID ? " selected" : ""
-            let suffix = mode.id == settings.defaultModeID ? " (button)" : ""
-            html += "<option value=\"\(htmlEscape(mode.id))\"\(selected)>\(htmlEscape(mode.name + suffix))</option>"
+    switch page {
+    case .scan:
+        if !wifiBackend || setup.configured {
+            html += renderScan(settings: settings, job: job)
+            html += renderStatus(job: job, ocr: ocr, localTime: localTime)
+        } else {
+            html += "<section class=\"empty-state\"><p class=\"eyebrow\">Setup required</p>"
+            html += "<h2>Connect a scanner before your first scan</h2>"
+            html += "<p class=\"muted\">Scanner discovery and connection are managed separately from everyday scanning.</p>"
+            html += "<a class=\"button-link\" href=\"/settings\">Open network setup</a></section>"
         }
-        html += "</select></label><div class=\"button-row\">"
-        html += "<button\(job.status == "running" ? " disabled" : "")>Start scan</button>"
-        html += "<button class=\"secondary-button\" formaction=\"/modes/default\">Use for button</button>"
-        html += "</div></form></section>"
+    case .documents:
+        html += renderFiles(groups, settings: settings)
+    case .presets:
+        html += renderBlankPageSettings(settings.blankPageSettings)
         html += renderModes(
             settings: settings,
-            selectedMode: selectedMode,
-            maximumOCRCPUs: ocr.cpuLimit,
-            scannerSetup: wifiBackend ? setup : nil,
-            open: editModeID != nil
+            selectedMode: selectedMode
         )
-        html += renderStatus(job: job, ocr: ocr, localTime: localTime)
-        html += renderFiles(groups)
+    case .workers:
+        html += renderWorkers(
+            workers,
+            jobs: workerJobs,
+            ocr: ocr,
+            internalWorkerPaused: internalWorkerPaused,
+            internalWorkerSettings: internalWorkerSettings,
+            localTime: localTime
+        )
+    case .settings:
+        if wifiBackend {
+            html += renderScannerSetup(setup)
+        } else {
+            html += "<section><p class=\"eyebrow\">Network Setup</p><h2>Scanner connection</h2>"
+            html += "<p>This server uses the <strong>sane</strong> scan backend. Its connection is configured outside the web interface.</p></section>"
+        }
     }
     return html
+}
+
+private func renderWorkers(
+    _ workers: [OCRWorkerSnapshot],
+    jobs: [OCRWorkerJobSnapshot],
+    ocr: OCRQueueState,
+    internalWorkerPaused: Bool,
+    internalWorkerSettings: InternalOCRWorkerSettings,
+    localTime: ScannerServerLocalTime
+) -> String {
+    var html = "<section class=\"workers-panel\" data-workers-panel><div class=\"section-heading\"><div>"
+    html += "<p class=\"eyebrow\">Distributed processing</p><h2>OCR workers</h2>"
+    html += "<p class=\"muted\">Register, approve, and monitor remote OCR capacity. Approved enabled workers get first refusal on compatible queued PDFs before local OCR.</p>"
+    html += "</div></div>"
+    let activeJobs = jobs.filter { $0.status == .queued || $0.status == .leased }
+    let localDone = ocr.recentJobs.filter {
+        $0.status == "done" && $0.executionLocation == .local
+    }
+    html += "<dl class=\"worker-facts\"><div><dt>Waiting</dt><dd>\(ocr.waitingJobs.count + activeJobs.filter { $0.status == .queued }.count)</dd></div>"
+    html += "<div><dt>Remote running</dt><dd>\(activeJobs.filter { $0.status == .leased }.count)</dd></div>"
+    html += "<div><dt>Completed</dt><dd>\(jobs.filter { $0.status == .succeeded }.count + localDone.count)</dd></div>"
+    html += "<div><dt>Failed</dt><dd>\(jobs.filter { $0.status == .failed }.count)</dd></div></dl>"
+
+    html += "<div class=\"worker-list\">"
+    html += renderInternalWorker(
+        ocr: ocr,
+        activeRemoteJobs: activeJobs,
+        paused: internalWorkerPaused,
+        settings: internalWorkerSettings
+    )
+    for worker in workers {
+        let workerJobs = activeJobs.filter { $0.workerID == worker.workerID }
+        let pageTimings = jobs.filter {
+            $0.status == .succeeded
+                && $0.completedWorkerID == worker.workerID
+                && $0.manifest.metadata?.pageNumber != nil
+                && $0.leasedAt != nil
+        }
+        let busyClass = workerJobs.isEmpty ? "" : " worker-card-busy"
+        html += "<article class=\"worker-card\(busyClass)\"><div class=\"worker-card-head\"><div>"
+        html += "<h3>\(htmlEscape(worker.displayName))</h3>"
+        html += "<p class=\"muted\">\(htmlEscape(worker.hostname)) · \(htmlEscape(worker.architecture))</p></div>"
+        html += workerStatusPill(worker.availability) + "</div>"
+        html += "<dl class=\"worker-facts\"><div><dt>Capacity</dt><dd>\(worker.cpuCount) CPUs · \(worker.maxConcurrentJobs) concurrent page"
+        if worker.maxConcurrentJobs != 1 { html += "s" }
+        html += " max</dd></div><div><dt>Running</dt><dd>\(worker.runningJobs)</dd></div>"
+        html += "<div><dt>Speed</dt><dd>\(workerSpeed(pageTimings))</dd></div>"
+        html += "<div><dt>Languages</dt><dd>\(htmlEscape(worker.ocrLanguages.joined(separator: ", ")))</dd></div>"
+        html += "<div><dt>Version</dt><dd>\(htmlEscape(worker.workerVersion))</dd></div></dl>"
+        html += "<p class=\"muted\">Last seen \(htmlEscape(localTime.statusTimestamp(for: worker.lastSeen)))</p>"
+        if !workerJobs.isEmpty {
+            html += "<div class=\"worker-active-jobs\"><strong>Processing now</strong>"
+            for job in workerJobs {
+                html += "<p>\(htmlEscape(workerJobTitle(job)))"
+                let details = workerJobDetails(job)
+                if !details.isEmpty { html += "<br><span class=\"muted\">\(htmlEscape(details))</span>" }
+                html += "</p>"
+            }
+            html += "</div>"
+        }
+        html += "<div class=\"button-row\">"
+        let encodedID = urlPathComponent(worker.workerID)
+        if !worker.approved {
+            html += "<form class=\"inline-form\" method=\"post\" action=\"/workers/\(encodedID)/approve\"><button>Approve worker</button></form>"
+        } else if worker.enabled {
+            if worker.paused {
+                html += "<form class=\"inline-form\" method=\"post\" action=\"/workers/\(encodedID)/resume\"><button>Resume</button></form>"
+            } else {
+                html += "<form class=\"inline-form\" method=\"post\" action=\"/workers/\(encodedID)/pause\"><button class=\"secondary-button\">Pause</button></form>"
+            }
+            html += "<form class=\"inline-form\" method=\"post\" action=\"/workers/\(encodedID)/disable\"><button class=\"secondary-button\">Disable</button></form>"
+        } else {
+            html += "<form class=\"inline-form\" method=\"post\" action=\"/workers/\(encodedID)/enable\"><button>Enable</button></form>"
+        }
+        html += "<form class=\"inline-form\" method=\"post\" action=\"/workers/\(encodedID)/delete\"><button class=\"danger-button\" data-confirm=\"Delete this worker registration? A running worker will register again and require approval.\">Delete</button></form>"
+        html += "</div></article>"
+    }
+    if workers.isEmpty {
+        html += "<div class=\"empty-state compact\"><h3>No remote workers registered</h3>"
+        html += "<p class=\"muted\">Start scannerserver-worker with this server's address. New workers will appear here for approval.</p></div>"
+    }
+    html += "</div>"
+    html += renderWorkerQueue(
+        ocr: ocr,
+        jobs: activeJobs,
+        workers: workers,
+        internalWorkerPaused: internalWorkerPaused,
+        localTime: localTime
+    )
+    html += renderWorkerHistory(ocr: ocr, jobs: jobs, workers: workers, localTime: localTime)
+    return html + "</section>"
+}
+
+private func renderInternalWorker(
+    ocr: OCRQueueState,
+    activeRemoteJobs: [OCRWorkerJobSnapshot],
+    paused: Bool,
+    settings: InternalOCRWorkerSettings
+) -> String {
+    let remoteKeys = Set(activeRemoteJobs.compactMap(workerJobKey))
+    let scheduledLocally = ocr.processingJobs.filter { !remoteKeys.contains(queueJobKey($0)) }.count
+    let localRunning = paused ? 0 : scheduledLocally
+    let localPages = ocr.recentJobs.filter {
+        $0.status == "done"
+            && $0.executionLocation == .local
+            && $0.metadata?.pageNumber != nil
+    }
+    let busyClass = localRunning > 0 ? " worker-card-busy" : ""
+    var html = "<article class=\"worker-card\(busyClass)\"><div class=\"worker-card-head\"><div>"
+    html += "<h3>Internal worker</h3><p class=\"muted\">scannerserver · local fallback</p></div>"
+    if paused {
+        html += "<span class=\"status-pill working\">Paused</span>"
+    } else if localRunning > 0 {
+        html += "<span class=\"status-pill working\">Processing</span>"
+    } else {
+        html += "<span class=\"status-pill success\">Available</span>"
+    }
+    html += "</div><dl class=\"worker-facts\"><div><dt>Capacity</dt><dd>\(settings.cpuLimit) CPUs</dd></div>"
+    html += "<div><dt>Running</dt><dd>\(localRunning)</dd></div>"
+    html += "<div><dt>Speed</dt><dd>\(localSpeed(localPages))</dd></div>"
+    let priorityLabel = switch settings.priority {
+    case .normal: "Normal"
+    case .niced: "Niced"
+    case .fallbackOnly: "Fallback only"
+    }
+    html += "<div><dt>Priority</dt><dd>\(priorityLabel)</dd></div></dl>"
+    if paused {
+        html += "<p class=\"muted\">Local OCR is stopped. Waiting work remains available to remote workers.</p>"
+        html += "<div class=\"button-row\"><form class=\"inline-form\" method=\"post\" action=\"/internal-worker/resume\"><button>Resume</button></form></div>"
+    } else {
+        html += "<p class=\"muted\">Available when no compatible remote worker takes a job.</p>"
+        html += "<div class=\"button-row\"><form class=\"inline-form\" method=\"post\" action=\"/internal-worker/pause\"><button class=\"secondary-button\">Pause</button></form></div>"
+    }
+    var cpuChoices = [("", "Automatic (up to \(settings.maximumCPUs))")]
+    cpuChoices += (1...settings.maximumCPUs).map { (String($0), "\($0)") }
+    html += "<form method=\"post\" action=\"/internal-worker/settings\" data-instant-worker-settings><fieldset class=\"setting-group\"><legend>Built-in worker settings</legend>"
+    html += "<div class=\"settings-grid settings-grid-two\">"
+    html += select(
+        name: "cpu_limit",
+        label: "Processing CPUs",
+        values: cpuChoices,
+        selected: settings.configuredCPULimit.map(String.init) ?? "",
+        help: "Automatic uses the scanner host's background CPU allowance while reserving one processor for scanning and the web service."
+    )
+    html += select(
+        name: "priority",
+        label: "Post-scan priority",
+        values: [
+            (InternalOCRWorkerPriority.normal.rawValue, "Normal"),
+            (InternalOCRWorkerPriority.niced.rawValue, "Niced (reduced)"),
+            (InternalOCRWorkerPriority.fallbackOnly.rawValue, "Fallback only"),
+        ],
+        selected: settings.priority.rawValue,
+        help: "Normal and niced use local capacity alongside remote workers. Fallback only waits while remote capacity is available and uses niced local processing only if remote work is unavailable or fails."
+    )
+    html += "</div><p class=\"setting-help\" data-worker-settings-status>Changes apply immediately.</p>"
+    html += "<noscript><div class=\"button-row\"><button type=\"submit\">Apply worker settings</button></div></noscript></fieldset></form>"
+    html += "</article>"
+    return html
+}
+
+private func renderWorkerQueue(
+    ocr: OCRQueueState,
+    jobs: [OCRWorkerJobSnapshot],
+    workers: [OCRWorkerSnapshot],
+    internalWorkerPaused: Bool,
+    localTime: ScannerServerLocalTime
+) -> String {
+    let remoteKeys = Set(jobs.compactMap(workerJobKey))
+    let localProcessing = ocr.processingJobs.filter { !remoteKeys.contains(queueJobKey($0)) }
+    guard !ocr.waitingJobs.isEmpty
+            || !localProcessing.isEmpty
+            || !ocr.finalizingJobs.isEmpty
+            || !jobs.isEmpty
+    else { return "" }
+    var html = "<div class=\"worker-job-section\"><h3>Waiting and running</h3><ul class=\"worker-job-list\">"
+    for job in localProcessing {
+        html += queueJobRow(
+            job,
+            assignment: internalWorkerPaused ? "OCR scheduler" : "Internal worker",
+            status: internalWorkerPaused ? "Waiting for remote worker" : "Processing",
+            localTime: localTime
+        )
+    }
+    for job in ocr.waitingJobs {
+        html += queueJobRow(job, assignment: "OCR scheduler", status: "Waiting", localTime: localTime)
+    }
+    for job in ocr.finalizingJobs {
+        html += queueJobRow(
+            job,
+            assignment: "Scanner server",
+            status: "Finalizing OCR document",
+            localTime: localTime
+        )
+    }
+    for job in jobs.sorted(by: { $0.manifest.createdAt < $1.manifest.createdAt }) {
+        let workerName = job.workerID.flatMap { id in workers.first { $0.workerID == id }?.displayName }
+        let assignment = workerName ?? (job.status == .queued ? "Waiting for worker" : "Remote worker")
+        html += workerJobRow(job, assignment: assignment, localTime: localTime)
+    }
+    return html + "</ul></div>"
+}
+
+private func renderWorkerHistory(
+    ocr: OCRQueueState,
+    jobs: [OCRWorkerJobSnapshot],
+    workers: [OCRWorkerSnapshot],
+    localTime: ScannerServerLocalTime
+) -> String {
+    let terminal = jobs.filter { $0.status != .queued && $0.status != .leased }.suffix(30).reversed()
+    let local = ocr.recentJobs.filter { $0.executionLocation == .local }.prefix(20)
+    guard !terminal.isEmpty || !local.isEmpty else { return "" }
+    var html = "<div class=\"worker-job-section\"><h3>Recent completed jobs</h3><ul class=\"worker-job-list\">"
+    for job in terminal {
+        let workerName = job.workerID.flatMap { id in workers.first { $0.workerID == id }?.displayName }
+            ?? "Remote worker"
+        html += workerJobRow(job, assignment: workerName, localTime: localTime)
+    }
+    for timing in local {
+        let title = timing.metadata.map { metadata in
+            metadata.pageNumber.map { "\(metadata.documentName) · page \($0)" } ?? metadata.documentName
+        } ?? URL(fileURLWithPath: timing.input).lastPathComponent
+        let operations = timing.metadata?.operations.joined(separator: " · ") ?? "Local processing"
+        html += "<li class=\"worker-job-row\"><strong>\(htmlEscape(title))</strong>"
+        html += "<span class=\"worker-job-operations\">\(htmlEscape(operations))</span>"
+        html += "<span class=\"worker-job-meta\">Internal worker</span>"
+        html += "<span class=\"worker-job-state\">\(htmlEscape(timing.status.capitalized)) · \(formatDuration(timing.duration))</span></li>"
+    }
+    return html + "</ul></div>"
+}
+
+private func queueJobRow(
+    _ job: OCRQueueJobSnapshot,
+    assignment: String,
+    status: String,
+    localTime: ScannerServerLocalTime
+) -> String {
+    let title = job.pageNumber.map { "\(job.documentName) · page \($0)" } ?? job.documentName
+    var detail = status
+    if let started = job.started {
+        detail += " · started \(localTime.statusTimestamp(for: started))"
+    }
+    return "<li class=\"worker-job-row\"><strong>\(htmlEscape(title))</strong>"
+        + "<span class=\"worker-job-operations\">\(htmlEscape(job.operations.joined(separator: " · ")))</span>"
+        + "<span class=\"worker-job-meta\">\(htmlEscape(assignment))</span>"
+        + "<span class=\"worker-job-state\">\(htmlEscape(detail))</span></li>"
+}
+
+private func workerJobRow(
+    _ job: OCRWorkerJobSnapshot,
+    assignment: String,
+    localTime: ScannerServerLocalTime
+) -> String {
+    var operations = workerJobDetails(job)
+    if let failure = job.failure, !failure.isEmpty {
+        if !operations.isEmpty { operations += " · " }
+        operations += failure
+    }
+    var status = job.status.rawValue.capitalized
+    if let leasedAt = job.leasedAt {
+        let duration = max(0, job.updatedAt.timeIntervalSince(leasedAt))
+        status += " · \(formatDuration(duration))"
+    } else {
+        status += " · \(localTime.statusTimestamp(for: job.updatedAt))"
+    }
+    return "<li class=\"worker-job-row\"><strong>\(htmlEscape(workerJobTitle(job)))</strong>"
+        + "<span class=\"worker-job-operations\">\(htmlEscape(operations))</span>"
+        + "<span class=\"worker-job-meta\">\(htmlEscape(assignment)) · attempt \(job.attemptCount)</span>"
+        + "<span class=\"worker-job-state\">\(htmlEscape(status))</span></li>"
+}
+
+private func workerSpeed(_ jobs: [OCRWorkerJobSnapshot]) -> String {
+    let durations = jobs.compactMap { job -> TimeInterval? in
+        guard let started = job.leasedAt else { return nil }
+        return max(0, job.updatedAt.timeIntervalSince(started))
+    }
+    guard !durations.isEmpty else { return "No page timings yet" }
+    return pageSpeed(totalDuration: durations.reduce(0, +), pageCount: durations.count)
+}
+
+private func localSpeed(_ jobs: [OCRJobTiming]) -> String {
+    guard !jobs.isEmpty else { return "No page timings yet" }
+    return pageSpeed(
+        totalDuration: jobs.reduce(0) { $0 + $1.duration },
+        pageCount: jobs.count
+    )
+}
+
+private func pageSpeed(totalDuration: TimeInterval, pageCount: Int) -> String {
+    let pageLabel = pageCount == 1 ? "page" : "pages"
+    let pagesPerMinute = 60 * Double(pageCount) / max(totalDuration, 0.001)
+    return String(format: "%.1f pages/min · %d %@", pagesPerMinute, pageCount, pageLabel)
+}
+
+private func formatDuration(_ duration: TimeInterval) -> String {
+    duration < 10 ? String(format: "%.1fs", duration) : "\(Int(duration.rounded()))s"
+}
+
+private func workerJobKey(_ job: OCRWorkerJobSnapshot) -> String? {
+    guard let metadata = job.manifest.metadata else { return nil }
+    return "\(metadata.documentName)#\(metadata.pageNumber ?? 0)"
+}
+
+private func queueJobKey(_ job: OCRQueueJobSnapshot) -> String {
+    "\(job.documentName)#\(job.pageNumber ?? 0)"
+}
+
+private func workerJobTitle(_ job: OCRWorkerJobSnapshot) -> String {
+    let documentName = job.manifest.metadata?.documentName
+        ?? URL(fileURLWithPath: job.manifest.sourcePath).lastPathComponent
+    if let pageNumber = job.manifest.metadata?.pageNumber {
+        return "\(documentName) · page \(pageNumber)"
+    }
+    return documentName
+}
+
+private func workerJobDetails(_ job: OCRWorkerJobSnapshot) -> String {
+    let operations = job.manifest.metadata?.operations ?? {
+        var values: [String] = []
+        if job.manifest.removeBlankPages { values.append("remove blank pages") }
+        if job.manifest.cropPages { values.append("trim/crop") }
+        if job.manifest.ocrEnabled {
+            values.append("OCR (\(job.manifest.ocrLanguages.joined(separator: "+")))")
+        }
+        return values
+    }()
+    return operations.joined(separator: " · ")
+}
+
+private func workerStatusPill(_ availability: OCRWorkerAvailability) -> String {
+    let label: String
+    let cssClass: String
+    switch availability {
+    case .pendingApproval:
+        label = "Approval required"
+        cssClass = "working"
+    case .online:
+        label = "Online"
+        cssClass = "success"
+    case .busy:
+        label = "Processing"
+        cssClass = "working"
+    case .paused:
+        label = "Paused"
+        cssClass = "working"
+    case .offline:
+        label = "Offline"
+        cssClass = "error"
+    case .disabled:
+        label = "Disabled"
+        cssClass = ""
+    }
+    return "<span class=\"status-pill \(cssClass)\">\(label)</span>"
+}
+
+private func renderNavigation(active: ScannerServerPage) -> String {
+    var html = "<nav class=\"primary-nav\" aria-label=\"Primary\">"
+    for page in ScannerServerPage.allCases {
+        let current = page == active ? " aria-current=\"page\"" : ""
+        html += "<a href=\"\(page.path)\"\(current)>\(htmlEscape(page.label))</a>"
+    }
+    return html + "</nav>"
+}
+
+private func renderScan(settings: ScanSettings, job: ScanJobState) -> String {
+    let buttonMode = settings.defaultMode
+    var html = "<section class=\"scan-panel\"><div class=\"section-heading\">"
+    html += "<div><p class=\"eyebrow\">Scanner controls</p><h2>Start a new scan</h2>"
+    html += "<p class=\"muted\">Choose a preset and start scanning. Preset settings are managed separately.</p></div>"
+    html += "</div><form class=\"scan-form\" method=\"post\" action=\"/scan\">"
+    html += "<label>Preset<select name=\"mode_id\" data-preset-select>"
+    for mode in settings.modes {
+        let selected = mode.id == settings.defaultModeID ? " selected" : ""
+        html += "<option value=\"\(htmlEscape(mode.id))\" data-summary=\"\(htmlEscape(modeSummary(mode)))\"\(selected)>\(htmlEscape(mode.name))</option>"
+    }
+    html += "</select><span class=\"setting-help\" data-preset-summary>\(htmlEscape(modeSummary(buttonMode)))</span></label>"
+    let scanDisabled = job.status == "running" ? " disabled" : ""
+    html += "<button class=\"primary-action\"\(scanDisabled)>Start scan</button>"
+    html += "</form>"
+    if let message = emptyFeederMessage(for: job) {
+        html += "<p class=\"warning\" role=\"alert\">\(htmlEscape(message))</p>"
+    }
+    if job.status == "running" {
+        html += "<form class=\"inline-form\" method=\"post\" action=\"/scan/cancel\"><button class=\"danger-button\" data-confirm=\"Cancel the current scan?\">Cancel scan</button></form>"
+    }
+    html += "<div class=\"button-preset-note\"><span>Physical button</span>"
+    html += "<strong>\(htmlEscape(buttonMode.name))</strong><a href=\"/presets?edit_mode=\(urlQueryValue(buttonMode.id))\">Manage</a>"
+    html += "</div></section>"
+    return html
+}
+
+private func emptyFeederMessage(for job: ScanJobState) -> String? {
+    guard job.status.hasPrefix("failed") else { return nil }
+    let diagnostic = "\(job.output)\n\(job.error)".lowercased()
+    let emptyFeederDiagnostics = [
+        "no pages were scanned",
+        "no document in scanner",
+    ]
+    guard emptyFeederDiagnostics.contains(where: diagnostic.contains) else { return nil }
+    return "No paper was detected in the feeder. Load paper, then start a new scan."
 }
 
 private func renderScannerReachabilitySummary(
@@ -849,11 +1966,11 @@ private func renderScannerReachabilitySummary(
 }
 
 private func renderScannerSetup(_ setup: ScannerSetupState) -> String {
-    "<section data-scanner-setup data-needs-password=\"\(setup.needsPassword)\">\(renderScannerSetupContent(setup))</section>"
+    "<section data-scanner-setup data-configured=\"\(setup.configured)\" data-needs-password=\"\(setup.needsPassword)\">\(renderScannerSetupContent(setup))</section>"
 }
 
 private func renderScannerSetupContent(_ setup: ScannerSetupState) -> String {
-    var html = "<h2>Scanner setup</h2>"
+    var html = "<h2>Network Setup</h2>"
     if setup.configured {
         html += "<p><strong>\(htmlEscape(setup.name))</strong> <span class=\"status\">configured</span></p>"
         html += "<p class=\"muted\">IP \(htmlEscape(setup.ipAddress))"
@@ -880,7 +1997,7 @@ private func renderScannerSetupContent(_ setup: ScannerSetupState) -> String {
     html += "<label>Scanner password or product serial number<input type=\"text\" name=\"scanner_credential\" required></label>"
     html += "<p class=\"muted\">If you never changed the scanner password, enter the product serial number printed on the scanner. The factory password will be derived automatically.</p>"
     html += "<button>Connect scanner</button></form>"
-    html += "<form method=\"post\" action=\"/setup/scanners/clear\"><button class=\"danger-button\">Clear scanner setup</button></form></div>"
+    html += "<form method=\"post\" action=\"/setup/scanners/clear\"><button class=\"danger-button\" data-confirm=\"Clear this scanner setup?\">Clear scanner setup</button></form></div>"
     return html
 }
 
@@ -894,24 +2011,62 @@ private func renderScannerDevices(_ devices: [ScannerSetupDevice]) -> String {
     return html
 }
 
+private func renderBlankPageSettings(_ settings: BlankPageSettings) -> String {
+    var html = "<section class=\"blank-page-settings\"><div class=\"section-heading\"><div>"
+    html += "<p class=\"eyebrow\">Document processing</p><h2>Blank-page detection</h2>"
+    html += "<p class=\"muted\">These thresholds are shared by every preset. Each preset separately controls whether blank-page removal is enabled.</p>"
+    html += "</div></div><form method=\"post\" action=\"/presets/blank-pages\">"
+    html += "<div class=\"settings-grid settings-grid-three\">"
+    html += numberInput(
+        name: "SCAN_BLANK_WHITE_THRESHOLD",
+        label: "White threshold",
+        value: String(settings.whiteThreshold),
+        minimum: "0",
+        maximum: "255",
+        step: "1",
+        help: "Pixels at or above this grayscale value count as white (0–255)."
+    )
+    html += numberInput(
+        name: "SCAN_BLANK_CONTENT_RATIO_THRESHOLD",
+        label: "Content ratio threshold",
+        value: settings.contentRatioThresholdText,
+        minimum: "0",
+        maximum: "1",
+        step: "0.0001",
+        help: "Maximum fraction of non-white pixels allowed on a blank page (0–1)."
+    )
+    html += numberInput(
+        name: "SCAN_BLANK_MEAN_THRESHOLD",
+        label: "Mean brightness threshold",
+        value: settings.meanThresholdText,
+        minimum: "0",
+        maximum: "255",
+        step: "0.1",
+        help: "Minimum average grayscale brightness required for a blank page (0–255)."
+    )
+    html += "</div><div class=\"button-row\"><button>Save blank-page thresholds</button></div>"
+    html += "</form></section>"
+    return html
+}
+
 private func renderModes(
     settings: ScanSettings,
-    selectedMode: ScanMode,
-    maximumOCRCPUs: Int,
-    scannerSetup: ScannerSetupState?,
-    open: Bool
+    selectedMode: ScanMode
 ) -> String {
-    var html = "<section><details\(open ? " open" : "")><summary>Advanced settings</summary><ul class=\"mode-list\">"
+    var html = "<section class=\"preset-workspace\"><div class=\"section-heading\"><div>"
+    html += "<p class=\"eyebrow\">Reusable configurations</p><h2>Scan presets</h2>"
+    html += "<p class=\"muted\">Create scan configurations and choose the preset used by the scanner's physical button.</p>"
+    html += "</div><a class=\"button-link secondary-link\" href=\"/presets?edit_mode=new\">New preset</a></div>"
+    html += "<div class=\"preset-layout\"><aside class=\"preset-sidebar\" aria-label=\"Saved presets\"><h3>Saved presets</h3><ul class=\"mode-list\">"
     for mode in settings.modes {
-        let badge = mode.id == settings.defaultModeID ? " <span class=\"default-badge\">button</span>" : ""
-        html += "<li><strong>\(htmlEscape(mode.name))</strong>\(badge)<div class=\"muted\">\(htmlEscape(modeSummary(mode)))</div></li>"
+        let selected = mode.id == selectedMode.id ? " aria-current=\"true\"" : ""
+        let badge = mode.id == settings.defaultModeID ? " <span class=\"default-badge\">Button</span>" : ""
+        html += "<li><a href=\"/presets?edit_mode=\(urlQueryValue(mode.id))\"\(selected)>"
+        html += "<strong>\(htmlEscape(mode.name))</strong>\(badge)<span class=\"muted\">\(htmlEscape(modeSummary(mode)))</span></a></li>"
     }
-    html += "</ul><form class=\"mode-load-form\" method=\"get\" action=\"/\"><label>Edit mode<select name=\"edit_mode\">"
-    for mode in settings.modes {
-        html += option(value: mode.id, label: mode.name, selected: mode.id == selectedMode.id)
-    }
-    html += option(value: "new", label: "New mode", selected: selectedMode.id.isEmpty)
-    html += "</select></label><button class=\"secondary-button\">Load</button></form>"
+    html += "</ul></aside><div class=\"preset-editor\"><div class=\"editor-heading\">"
+    html += "<p class=\"eyebrow\">\(selectedMode.id.isEmpty ? "New preset" : "Edit preset")</p>"
+    html += "<h3>\(htmlEscape(selectedMode.id.isEmpty ? "Untitled preset" : selectedMode.name))</h3></div>"
     html += "<form class=\"mode-editor-form\" method=\"post\" action=\"/modes/save\">"
     html += "<input type=\"hidden\" name=\"mode_id\" value=\"\(htmlEscape(selectedMode.id))\">"
     html += "<fieldset class=\"setting-group\"><legend>Document</legend>"
@@ -980,29 +2135,6 @@ private func renderModes(
         selected: selectedMode.settings.language,
         help: "Languages used by Tesseract when OCR is enabled."
     )
-    var cpuChoices = [("", "Automatic (up to \(maximumOCRCPUs))")]
-    cpuChoices += (1...max(1, maximumOCRCPUs)).map { (String($0), "\($0)") }
-    if let selectedLimit = selectedMode.settings.ocrCPULimit,
-       selectedLimit > maximumOCRCPUs {
-        cpuChoices.append((
-            String(selectedLimit),
-            "\(selectedLimit) (currently capped to \(maximumOCRCPUs))"
-        ))
-    }
-    html += select(
-        name: "SCAN_OCR_CPU_LIMIT",
-        label: "Processing CPUs",
-        values: cpuChoices,
-        selected: selectedMode.settings.ocrCPULimitText,
-        help: "Automatic uses the background CPU allowance while reserving one processor for scanning and the web service."
-    )
-    html += select(
-        name: "SCAN_OCR_NICE",
-        label: "Post-scan priority",
-        values: [("false", "Normal"), ("true", "Niced (reduced)")],
-        selected: selectedMode.settings.ocrNiceText,
-        help: "Niced background processing yields CPU time while scanning and the web service remain at normal priority."
-    )
     html += "</div><div class=\"setting-card\">"
     html += checkbox(
         name: "SCAN_CROP_PAGES",
@@ -1025,6 +2157,12 @@ private func renderModes(
         checked: selectedMode.settings.removeBlankPages,
         help: "Discard pages detected as blank during background PDF processing."
     )
+    html += checkbox(
+        name: "SCAN_OCR_ONLY",
+        label: "Publish OCR result only",
+        checked: selectedMode.settings.ocrOnly,
+        help: "Publish only the searchable OCR PDF to the scan directory and keep the raw PDF private until OCR succeeds. On OCR failure the raw PDF is published instead; if that fails too, the raw scan stays in the private work directory. Cancelled scans are not published."
+    )
     html += "</div></div></fieldset>"
     html += "<fieldset class=\"setting-group\"><legend>Physical button</legend>"
     html += "<div class=\"button-setting-card\">"
@@ -1036,13 +2174,9 @@ private func renderModes(
     )
     html += "</div></fieldset><div class=\"mode-actions button-row\"><button>Save mode</button>"
     if !selectedMode.id.isEmpty {
-        html += "<button class=\"danger-button\" formaction=\"/modes/delete\">Delete mode</button>"
+        html += "<button class=\"danger-button\" formaction=\"/modes/delete\" data-confirm=\"Delete this preset?\">Delete mode</button>"
     }
-    html += "</div></form>"
-    if let scannerSetup {
-        html += "<div class=\"advanced-setup\">\(renderScannerSetupContent(scannerSetup))</div>"
-    }
-    html += "</details></section>"
+    html += "</div></form></div></div></section>"
     return html
 }
 
@@ -1051,21 +2185,28 @@ private func renderStatus(
     ocr: OCRQueueState,
     localTime: ScannerServerLocalTime
 ) -> String {
-    var html = "<section><h2>Status</h2><p><span class=\"status\">\(htmlEscape(job.status))</span></p>"
+    var html = "<section class=\"activity-panel\"><div class=\"section-heading\"><div>"
+    html += "<p class=\"eyebrow\">Live progress</p><h2>Current activity</h2></div>"
+    html += "<a href=\"/documents\">View documents</a></div><div class=\"activity-grid\">"
+    html += "<article class=\"activity-card\"><div class=\"activity-card-head\"><h3>Scan</h3>"
+    html += statusPill(job.status) + "</div>"
     if let started = job.started {
-        html += "<p>Started: \(htmlEscape(localTime.statusTimestamp(for: started)))</p>"
+        html += "<p class=\"muted\">Started \(htmlEscape(localTime.statusTimestamp(for: started)))</p>"
     }
     if let finished = job.finished {
-        html += "<p>Finished: \(htmlEscape(localTime.statusTimestamp(for: finished)))</p>"
+        html += "<p class=\"muted\">Finished \(htmlEscape(localTime.statusTimestamp(for: finished)))</p>"
     }
-    if !job.output.isEmpty { html += "<pre>\(htmlEscape(job.output))</pre>" }
-    if !job.error.isEmpty { html += "<pre>\(htmlEscape(job.error))</pre>" }
-
-    html += "<h2>Background processing</h2><p><span class=\"status\">\(htmlEscape(ocr.status))</span>"
-    if ocr.running > 1 { html += " \(ocr.running) jobs active" }
-    if ocr.queued > 0 { html += " \(ocr.queued) queued" }
-    html += "</p>"
-    html += "<p>CPU budget: \(ocr.cpuLimit); priority: "
+    if !job.output.isEmpty || !job.error.isEmpty {
+        html += "<details class=\"technical-details\"><summary>Technical details</summary>"
+        if !job.output.isEmpty { html += "<pre>\(htmlEscape(job.output))</pre>" }
+        if !job.error.isEmpty { html += "<pre>\(htmlEscape(job.error))</pre>" }
+        html += "</details>"
+    }
+    html += "</article><article class=\"activity-card\"><div class=\"activity-card-head\"><h3>Background processing</h3>"
+    html += statusPill(ocr.status)
+    if ocr.running > 1 { html += "<span class=\"queue-count\">\(ocr.running) jobs active</span>" }
+    if ocr.queued > 0 { html += "<span class=\"queue-count\">\(ocr.queued) queued</span>" }
+    html += "</div><p class=\"muted\">CPU budget \(ocr.cpuLimit) · priority "
     if let niceLevel = ocr.niceLevel {
         html += "nice +\(niceLevel)"
     } else {
@@ -1073,53 +2214,91 @@ private func renderStatus(
     }
     html += "</p>"
     if ocr.status == "running" || ocr.status == "queued" || ocr.queued > 0 {
-        html += "<form method=\"post\" action=\"/ocr/cancel\"><button class=\"danger-button\">Cancel processing</button></form>"
+        html += "<form class=\"inline-form\" method=\"post\" action=\"/ocr/cancel\"><button class=\"danger-button\">Cancel processing</button></form>"
     }
     if let started = ocr.started {
-        html += "<p>Started: \(htmlEscape(localTime.statusTimestamp(for: started)))</p>"
+        html += "<p class=\"muted\">Started \(htmlEscape(localTime.statusTimestamp(for: started)))</p>"
     }
     if let finished = ocr.finished {
-        html += "<p>Finished: \(htmlEscape(localTime.statusTimestamp(for: finished)))</p>"
+        html += "<p class=\"muted\">Finished \(htmlEscape(localTime.statusTimestamp(for: finished)))</p>"
     }
-    if !ocr.input.isEmpty { html += "<p>Input: \(htmlEscape(ocr.input))</p>" }
-    if !ocr.output.isEmpty { html += "<pre>\(htmlEscape(ocr.output))</pre>" }
-    if !ocr.error.isEmpty { html += "<pre>\(htmlEscape(ocr.error))</pre>" }
+    if !ocr.input.isEmpty || !ocr.output.isEmpty || !ocr.error.isEmpty {
+        html += "<details class=\"technical-details\"><summary>Technical details</summary>"
+        if !ocr.input.isEmpty { html += "<p>Input: \(htmlEscape(ocr.input))</p>" }
+        if !ocr.output.isEmpty { html += "<pre>\(htmlEscape(ocr.output))</pre>" }
+        if !ocr.error.isEmpty { html += "<pre>\(htmlEscape(ocr.error))</pre>" }
+        html += "</details>"
+    }
     if !ocr.recentJobs.isEmpty {
-        html += "<h3>Recent processing jobs</h3><ul class=\"ocr-history\">"
+        html += "<details class=\"technical-details\"><summary>Recent processing jobs</summary><ul class=\"ocr-history\">"
         for recent in ocr.recentJobs {
             let name = URL(fileURLWithPath: recent.input).lastPathComponent
             html += "<li><span class=\"file-name\">\(htmlEscape(name))</span>: "
             html += "\(htmlEscape(recent.status)) in \(htmlEscape(elapsedTime(recent.duration)))</li>"
         }
-        html += "</ul>"
+        html += "</ul></details>"
     }
+    return html + "</article></div></section>"
+}
+
+private func renderFiles(_ groups: [ScanDayGroup], settings: ScanSettings) -> String {
+    var html = "<section class=\"documents-panel\"><div class=\"section-heading\"><div>"
+    html += "<p class=\"eyebrow\">Scan results</p><h2>Documents</h2>"
+    html += "<p class=\"muted\">Open completed scans, download source files, or remove documents.</p></div></div>"
+    html += "<div class=\"pdf-drop-zone\" data-pdf-drop-zone tabindex=\"0\" role=\"button\" aria-label=\"Import PDFs for OCR\">"
+    html += "<input type=\"file\" accept=\"application/pdf,.pdf\" multiple hidden data-pdf-file-input>"
+    html += "<div><h3>Drop PDFs here for OCR</h3><p class=\"muted\">The original PDF is kept and an OCR PDF appears beside it. Pages are distributed across available workers using the selected preset's OCR, blank-page, and crop settings.</p></div>"
+    html += "<div class=\"pdf-import-controls\"><label>OCR preset<select data-pdf-preset>"
+    for mode in settings.modes {
+        html += option(value: mode.id, label: mode.name, selected: mode.id == settings.defaultModeID)
+    }
+    html += "</select></label><button type=\"button\" data-pdf-choose>Choose PDFs</button></div>"
+    html += "<p class=\"pdf-import-status muted\" data-pdf-import-status role=\"status\" aria-live=\"polite\"></p></div>"
+    html += renderDocumentResults(groups)
     return html + "</section>"
 }
 
-private func renderFiles(_ groups: [ScanDayGroup]) -> String {
-    var html = "<section><h2>Files</h2>"
-    guard !groups.isEmpty else { return html + "<p>No scans yet.</p></section>" }
-    html += "<form method=\"post\" action=\"/files/delete-selected\"><div class=\"button-row\">"
-    html += "<label><input type=\"checkbox\" data-select-all> Select all</label>"
-    html += "<button class=\"danger-button\">Delete selected</button></div><div class=\"file-groups\">"
+private func renderDocumentResults(_ groups: [ScanDayGroup]) -> String {
+    var html = "<div data-document-results>"
+    guard !groups.isEmpty else {
+        return html + "<div class=\"empty-state compact\"><h3>No scans yet</h3><p class=\"muted\">Completed scans will appear here.</p><a class=\"button-link\" href=\"/\">Start a scan</a></div></div>"
+    }
+    html += "<form class=\"documents-form\" method=\"post\" action=\"/files/delete-selected\"><div class=\"document-actions\">"
+    html += "<label class=\"select-all\"><input type=\"checkbox\" data-select-all> Select all</label>"
+    html += "<button class=\"danger-button compact-button\" data-confirm=\"Delete the selected files?\">Delete selected</button></div><div class=\"file-groups\">"
     for group in groups {
         html += "<div><h3>\(htmlEscape(group.day))</h3><ul class=\"file-list\">"
         for document in group.files {
             let viewPath = urlPathComponent(document.viewName)
             let previewPath = urlPathComponent(document.previewName)
-            html += "<li class=\"file-row\"><a href=\"/view/\(viewPath)\" target=\"_blank\"><img class=\"file-preview\" src=\"/files/\(previewPath)/preview\" alt=\"\"></a><div>"
-            html += "<strong>\(htmlEscape(document.title))</strong>"
+            html += "<li class=\"file-row\"><a class=\"preview-link\" href=\"/view/\(viewPath)\" target=\"_blank\"><img class=\"file-preview\" src=\"/files/\(previewPath)/preview\" alt=\"Preview of \(htmlEscape(document.title))\"></a><div class=\"file-details\">"
+            html += "<a class=\"document-title\" href=\"/view/\(viewPath)\" target=\"_blank\">\(htmlEscape(document.title))</a>"
             for file in document.files {
                 let path = urlPathComponent(file.name)
                 html += "<div class=\"file-variant\"><input type=\"checkbox\" name=\"files\" value=\"\(htmlEscape(file.name))\">"
                 html += "<a href=\"/files/\(path)\">\(htmlEscape(file.kind.label))</a> <span class=\"file-name\">\(htmlEscape(file.name))</span>"
-                html += "<button class=\"danger-button\" formaction=\"/files/\(path)/delete\">Delete</button></div>"
+                html += "<button class=\"danger-button compact-button\" formaction=\"/files/\(path)/delete\" data-confirm=\"Delete this file?\">Delete</button></div>"
             }
             html += "</div></li>"
         }
         html += "</ul></div>"
     }
-    return html + "</div></form></section>"
+    return html + "</div></form></div>"
+}
+
+private func statusPill(_ status: String) -> String {
+    let normalized = status.lowercased()
+    let style: String
+    if ["running", "queued"].contains(normalized) {
+        style = "working"
+    } else if ["done", "idle"].contains(normalized) {
+        style = "success"
+    } else if normalized.hasPrefix("failed") || ["error", "cancelled"].contains(normalized) {
+        style = "error"
+    } else {
+        style = "neutral"
+    }
+    return "<span class=\"status-pill \(style)\">\(htmlEscape(status.capitalized))</span>"
 }
 
 private func modeSummary(_ mode: ScanMode) -> String {
@@ -1159,12 +2338,14 @@ private func numberInput(
     label: String,
     value: String,
     minimum: String,
+    maximum: String? = nil,
     step: String,
     help: String
 ) -> String {
-    "<label>\(htmlEscape(label))<input type=\"number\" name=\"\(htmlEscape(name))\" "
+    let maximumAttribute = maximum.map { " max=\"\(htmlEscape($0))\"" } ?? ""
+    return "<label>\(htmlEscape(label))<input type=\"number\" name=\"\(htmlEscape(name))\" "
         + "value=\"\(htmlEscape(value))\" min=\"\(htmlEscape(minimum))\" "
-        + "step=\"\(htmlEscape(step))\">\(settingHelp(help))</label>"
+        + "step=\"\(htmlEscape(step))\"\(maximumAttribute)>\(settingHelp(help))</label>"
 }
 
 private func select(

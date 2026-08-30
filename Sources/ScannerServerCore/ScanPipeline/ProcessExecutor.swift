@@ -57,18 +57,15 @@ public struct ProcessResult: Equatable, Sendable {
     public let exitStatus: Int32
     public let standardOutput: String
     public let standardError: String
-    public let deferredScanProcessing: DeferredScanProcessing?
 
     public init(
         exitStatus: Int32,
         standardOutput: String = "",
-        standardError: String = "",
-        deferredScanProcessing: DeferredScanProcessing? = nil
+        standardError: String = ""
     ) {
         self.exitStatus = exitStatus
         self.standardOutput = standardOutput
         self.standardError = standardError
-        self.deferredScanProcessing = deferredScanProcessing
     }
 
     public var succeeded: Bool { exitStatus == 0 }

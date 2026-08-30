@@ -4,6 +4,432 @@ import Testing
 
 @Suite("OCR queue actor")
 struct OCRQueueActorTests {
+    @Test("Streaming pages start OCR before acquisition finishes and assemble in order")
+    func streamingPages() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "streaming-ocr-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent(".scan-work.test", isDirectory: true)
+        let final = root.appendingPathComponent("2026-08-15.143000.ocr.pdf")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        let pdf = Data("%PDF-1.4\nstreamed\n".utf8)
+        let executor = FakeProcessExecutor(stubs: [
+            .materializeLastArgument(pdf, ProcessResult(exitStatus: 0)),
+            .materializeLastArgument(pdf, ProcessResult(exitStatus: 0)),
+            .materializeLastArgument(pdf, ProcessResult(exitStatus: 0)),
+            .result(ProcessResult(exitStatus: 0)),
+        ])
+        let queue = OCRQueueActor(
+            ocrExecutor: executor,
+            documentExecutor: executor,
+            configuration: OCRQueueConfiguration(cpuLimit: 2)
+        )
+        let batchID = await queue.beginStreamingScan(StreamingScanRequest(
+            documentName: "2026-08-15.143000.pdf",
+            finalOutputPath: final.path,
+            workDirectory: work,
+            environment: ["SCAN_LANGUAGE": "deu+eng"],
+            removeBlankPages: false,
+            cropPages: false
+        ))
+
+        try await queue.submitStreamingPage(
+            batchID: batchID,
+            page: ScanSnapAcquiredPage(pageNumber: 1, jpegData: Data([0xff, 0xd8, 0xff, 0xd9]))
+        )
+        await executor.waitForRequestCount(1)
+        let requestCount = await executor.requests().count
+        #expect(requestCount == 1)
+
+        try await queue.submitStreamingPage(
+            batchID: batchID,
+            page: ScanSnapAcquiredPage(pageNumber: 2, jpegData: Data([0xff, 0xd8, 0xff, 0xd9]))
+        )
+        try await queue.finishStreamingScan(batchID: batchID, pageCount: 2)
+        await queue.waitUntilIdle()
+
+        let requests = await executor.requests()
+        let ocrRequests = await executor.ocrRequests()
+        #expect(requests.map(\.executable) == ["ocrmypdf", "ocrmypdf", "qpdf", "set-pdf-creator"])
+        #expect(ocrRequests[0].metadata?.documentName == "2026-08-15.143000.pdf")
+        #expect(Set(ocrRequests.prefix(2).compactMap { $0.metadata?.pageNumber }) == Set([1, 2]))
+        #expect(requests[2].arguments.contains { $0.hasSuffix("page-0001.ocr.pdf") })
+        #expect(requests[2].arguments.contains { $0.hasSuffix("page-0002.ocr.pdf") })
+        #expect(try Data(contentsOf: final) == pdf)
+        #expect(!FileManager.default.fileExists(atPath: work.path))
+        let state = await queue.state
+        let pageTimings = state.recentJobs.filter { $0.metadata?.pageNumber != nil }
+        #expect(pageTimings.count == 2)
+        #expect(pageTimings.allSatisfy { $0.executionLocation == .local })
+    }
+
+    @Test("Submitting a page cannot erase an earlier page completion across suspension")
+    func streamingPageSubmissionReentrancy() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "streaming-reentrancy-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent(".scan-work.test", isDirectory: true)
+        let final = root.appendingPathComponent("2026-08-15.222202.ocr.pdf")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        let pdf = Data("%PDF-1.4\nstreamed\n".utf8)
+        let executor = FakeProcessExecutor(stubs: [
+            .suspendedMaterializeLastArgument(pdf, ProcessResult(exitStatus: 0)),
+            .suspendedMaterializeLastArgument(pdf, ProcessResult(exitStatus: 0)),
+            .materializeLastArgument(pdf, ProcessResult(exitStatus: 0)),
+            .result(ProcessResult(exitStatus: 0)),
+        ])
+        let pageWriter = SuspendingStreamingPagePDFWriter()
+        let queue = OCRQueueActor(
+            ocrExecutor: executor,
+            documentExecutor: executor,
+            streamingPageWriter: pageWriter,
+            configuration: OCRQueueConfiguration(cpuLimit: 1)
+        )
+        let batchID = await queue.beginStreamingScan(StreamingScanRequest(
+            documentName: "2026-08-15.222202.pdf",
+            finalOutputPath: final.path,
+            workDirectory: work,
+            environment: ["SCAN_LANGUAGE": "deu+eng"],
+            removeBlankPages: false,
+            cropPages: false
+        ))
+
+        try await queue.submitStreamingPage(
+            batchID: batchID,
+            page: ScanSnapAcquiredPage(pageNumber: 1, jpegData: Data([0xff, 0xd8, 0xff, 0xd9]))
+        )
+        await executor.waitForRequestCount(1)
+
+        let secondSubmission = Task {
+            try await queue.submitStreamingPage(
+                batchID: batchID,
+                page: ScanSnapAcquiredPage(
+                    pageNumber: 2,
+                    jpegData: Data([0xff, 0xd8, 0xff, 0xd9])
+                )
+            )
+        }
+        await pageWriter.waitUntilSecondWriteIsSuspended()
+
+        let firstCompletionRevision = await queue.webUpdates.currentRevision
+        await executor.resumeNextSuspendedExecution()
+        _ = await queue.webUpdates.wait(after: firstCompletionRevision)
+
+        await pageWriter.resumeSecondWrite()
+        try await secondSubmission.value
+        await executor.waitForRequestCount(2)
+        try await queue.finishStreamingScan(batchID: batchID, pageCount: 2)
+
+        let secondCompletionRevision = await queue.webUpdates.currentRevision
+        await executor.resumeNextSuspendedExecution()
+        _ = await queue.webUpdates.wait(after: secondCompletionRevision)
+        await queue.waitUntilIdle()
+
+        #expect(FileManager.default.fileExists(atPath: final.path))
+        #expect(await executor.requests().map(\.executable) == [
+            "ocrmypdf", "ocrmypdf", "qpdf", "set-pdf-creator",
+        ])
+        await queue.cancelAll()
+    }
+
+    @Test("A completed final page is not reported as processing during document assembly")
+    func streamingFinalPageStateDuringAssembly() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "streaming-finalization-state-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent(".scan-work.test", isDirectory: true)
+        let final = root.appendingPathComponent("2026-08-16.072935.ocr.pdf")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        let pdf = Data("%PDF-1.4\nstreamed\n".utf8)
+        let executor = FakeProcessExecutor(stubs: [
+            .suspendedMaterializeLastArgument(pdf, ProcessResult(exitStatus: 0)),
+            .suspendedMaterializeLastArgument(pdf, ProcessResult(exitStatus: 0)),
+            .result(ProcessResult(exitStatus: 0)),
+        ], ocrLocation: .remote)
+        let queue = OCRQueueActor(
+            ocrExecutor: executor,
+            documentExecutor: executor,
+            configuration: OCRQueueConfiguration(cpuLimit: 1)
+        )
+        let batchID = await queue.beginStreamingScan(StreamingScanRequest(
+            documentName: "2026-08-16.072935.pdf",
+            finalOutputPath: final.path,
+            workDirectory: work,
+            environment: ["SCAN_LANGUAGE": "deu"],
+            removeBlankPages: false,
+            cropPages: true
+        ))
+
+        try await queue.submitStreamingPage(
+            batchID: batchID,
+            page: ScanSnapAcquiredPage(pageNumber: 62, jpegData: Data([0xff, 0xd8, 0xff, 0xd9]))
+        )
+        await executor.waitForRequestCount(1)
+        try await queue.finishStreamingScan(batchID: batchID, pageCount: 1)
+
+        await executor.resumeNextSuspendedExecution()
+        await executor.waitForRequestCount(2)
+
+        let assemblingState = await queue.state
+        #expect(assemblingState.recentJobs.first?.status == "done")
+        #expect(assemblingState.processingJobs.isEmpty)
+        #expect(assemblingState.finalizingJobs.count == 1)
+        #expect(assemblingState.finalizingJobs.first?.documentName == "2026-08-16.072935.pdf")
+        #expect(assemblingState.finalizingJobs.first?.operations == [
+            "assemble OCR pages", "publish searchable PDF",
+        ])
+
+        await executor.resumeNextSuspendedExecution()
+        await queue.waitUntilIdle()
+        #expect(FileManager.default.fileExists(atPath: final.path))
+    }
+
+    @Test("Streaming autocrop is requested from the remote worker and not repeated after assembly")
+    func streamingRemoteAutocrop() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "streaming-remote-crop-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent(".scan-work.test", isDirectory: true)
+        let final = root.appendingPathComponent("2026-08-15.160206.ocr.pdf")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        let pdf = Data("%PDF-1.4\nremote cropped\n".utf8)
+        let executor = FakeProcessExecutor(stubs: [
+            .materializeLastArgument(pdf, ProcessResult(exitStatus: 0)),
+            .materializeLastArgument(pdf, ProcessResult(exitStatus: 0)),
+            .result(ProcessResult(exitStatus: 0)),
+        ], ocrLocation: .remote)
+        let queue = OCRQueueActor(
+            ocrExecutor: executor,
+            documentExecutor: executor,
+            configuration: OCRQueueConfiguration(cpuLimit: 1)
+        )
+        let batchID = await queue.beginStreamingScan(StreamingScanRequest(
+            documentName: "2026-08-15.160206.pdf",
+            finalOutputPath: final.path,
+            workDirectory: work,
+            environment: [
+                "SCAN_LANGUAGE": "deu+eng",
+                "SCAN_CROP_MARGIN_POINTS": "2.5",
+            ],
+            removeBlankPages: false,
+            cropPages: true
+        ))
+
+        try await queue.submitStreamingPage(
+            batchID: batchID,
+            page: ScanSnapAcquiredPage(pageNumber: 1, jpegData: Data([0xff, 0xd8, 0xff, 0xd9]))
+        )
+        try await queue.finishStreamingScan(batchID: batchID, pageCount: 1)
+        await queue.waitUntilIdle()
+
+        let requests = await executor.requests()
+        #expect(requests.map(\.executable) == ["ocrmypdf", "qpdf", "set-pdf-creator"])
+        #expect(await executor.ocrRequests().first?.cropConfiguration?.marginPoints == 2.5)
+        #expect(try Data(contentsOf: final) == pdf)
+    }
+
+    @Test("Streaming autocrop falls back locally when OCR was not remote")
+    func streamingLocalAutocropFallback() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "streaming-local-crop-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent(".scan-work.test", isDirectory: true)
+        let final = root.appendingPathComponent("2026-08-15.160207.ocr.pdf")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        let pdf = Data("%PDF-1.4\nlocally cropped\n".utf8)
+        let executor = FakeProcessExecutor(stubs: [
+            .materializeLastArgument(pdf, ProcessResult(exitStatus: 0)),
+            .result(ProcessResult(exitStatus: 0)),
+            .materializeLastArgument(pdf, ProcessResult(exitStatus: 0)),
+            .result(ProcessResult(exitStatus: 0)),
+        ])
+        let queue = OCRQueueActor(
+            ocrExecutor: executor,
+            documentExecutor: executor,
+            configuration: OCRQueueConfiguration(cpuLimit: 1)
+        )
+        let batchID = await queue.beginStreamingScan(StreamingScanRequest(
+            documentName: "2026-08-15.160207.pdf",
+            finalOutputPath: final.path,
+            workDirectory: work,
+            environment: ["SCAN_LANGUAGE": "deu+eng"],
+            removeBlankPages: false,
+            cropPages: true
+        ))
+
+        try await queue.submitStreamingPage(
+            batchID: batchID,
+            page: ScanSnapAcquiredPage(pageNumber: 1, jpegData: Data([0xff, 0xd8, 0xff, 0xd9]))
+        )
+        try await queue.finishStreamingScan(batchID: batchID, pageCount: 1)
+        await queue.waitUntilIdle()
+
+        #expect(await executor.requests().map(\.executable) == [
+            "ocrmypdf", "crop-pdf-pages", "qpdf", "set-pdf-creator",
+        ])
+        #expect(try Data(contentsOf: final) == pdf)
+    }
+
+    @Test("Streaming blank removal runs per page and is not repeated after assembly")
+    func streamingBlankRemoval() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "streaming-blank-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent(".scan-work.test", isDirectory: true)
+        let final = root.appendingPathComponent("2026-08-16.082110.ocr.pdf")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        let pdf = Data("%PDF-1.4\npage filtered on worker\n".utf8)
+        let executor = FakeProcessExecutor(stubs: [
+            .materializeLastArgument(pdf, ProcessResult(exitStatus: 0)),
+            .result(ProcessResult(exitStatus: 0, standardOutput: "Removed 0 blank pages.\n")),
+            .result(ProcessResult(exitStatus: 0, standardOutput: "1\n")),
+            .materializeLastArgument(pdf, ProcessResult(exitStatus: 0)),
+            .result(ProcessResult(exitStatus: 0)),
+        ])
+        let queue = OCRQueueActor(
+            ocrExecutor: executor,
+            documentExecutor: executor,
+            configuration: OCRQueueConfiguration(cpuLimit: 1)
+        )
+        let batchID = await queue.beginStreamingScan(StreamingScanRequest(
+            documentName: "2026-08-16.082110.pdf",
+            finalOutputPath: final.path,
+            workDirectory: work,
+            environment: [
+                "SCAN_BLANK_WHITE_THRESHOLD": "240",
+                "SCAN_BLANK_CONTENT_RATIO_THRESHOLD": "0.004",
+                "SCAN_BLANK_MEAN_THRESHOLD": "249",
+            ],
+            removeBlankPages: true,
+            cropPages: false
+        ))
+
+        try await queue.submitStreamingPage(
+            batchID: batchID,
+            page: ScanSnapAcquiredPage(pageNumber: 1, jpegData: Data([0xff, 0xd8, 0xff, 0xd9]))
+        )
+        try await queue.finishStreamingScan(batchID: batchID, pageCount: 1)
+        await queue.waitUntilIdle()
+
+        let requests = await executor.requests()
+        #expect(requests.map(\.executable) == [
+            "ocrmypdf", "remove-blank-pages", "qpdf", "qpdf", "set-pdf-creator",
+        ])
+        #expect(await executor.ocrRequests().first?.blankPageConfiguration == OCRWorkerBlankPageConfiguration(
+            whiteThreshold: 240,
+            contentRatioThreshold: 0.004,
+            meanThreshold: 249
+        ))
+        #expect(requests[1].arguments.contains("--no-keep-one"))
+        #expect(requests[2].arguments.first == "--show-npages")
+        #expect(try Data(contentsOf: final) == pdf)
+    }
+
+    @Test("An entirely blank streaming scan keeps its first source page")
+    func streamingAllBlankKeepsOnePage() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "streaming-all-blank-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent(".scan-work.test", isDirectory: true)
+        let final = root.appendingPathComponent("2026-08-16.082111.ocr.pdf")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        let emptyPDF = Data("%PDF-1.4\nzero pages\n".utf8)
+        let executor = FakeProcessExecutor(stubs: [
+            .materializeLastArgument(emptyPDF, ProcessResult(exitStatus: 0)),
+            .result(ProcessResult(exitStatus: 0, standardOutput: "Removed 1 blank page.\n")),
+            .result(ProcessResult(exitStatus: 0, standardOutput: "0\n")),
+            .result(ProcessResult(exitStatus: 0)),
+        ])
+        let queue = OCRQueueActor(
+            ocrExecutor: executor,
+            documentExecutor: executor,
+            configuration: OCRQueueConfiguration(cpuLimit: 1)
+        )
+        let batchID = await queue.beginStreamingScan(StreamingScanRequest(
+            documentName: "2026-08-16.082111.pdf",
+            finalOutputPath: final.path,
+            workDirectory: work,
+            environment: [:],
+            removeBlankPages: true,
+            cropPages: false
+        ))
+
+        try await queue.submitStreamingPage(
+            batchID: batchID,
+            page: ScanSnapAcquiredPage(pageNumber: 1, jpegData: Data([0xff, 0xd8, 0xff, 0xd9]))
+        )
+        try await queue.finishStreamingScan(batchID: batchID, pageCount: 1)
+        await queue.waitUntilIdle()
+
+        #expect(FileManager.default.fileExists(atPath: final.path))
+        #expect(await executor.requests().map(\.executable) == [
+            "ocrmypdf", "remove-blank-pages", "qpdf", "set-pdf-creator",
+        ])
+    }
+
+    @Test("Deleting a raw document cancels its active and queued streaming pages")
+    func deletingStreamingDocument() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "streaming-delete-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent(".scan-work.test", isDirectory: true)
+        let raw = root.appendingPathComponent("2026-08-15.210920.pdf")
+        let final = root.appendingPathComponent("2026-08-15.210920.ocr.pdf")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        let executor = FakeProcessExecutor(stubs: [
+            .suspended(ProcessResult(exitStatus: 0)),
+        ])
+        let queue = OCRQueueActor(
+            ocrExecutor: executor,
+            configuration: OCRQueueConfiguration(cpuLimit: 1)
+        )
+        let batchID = await queue.beginStreamingScan(StreamingScanRequest(
+            documentName: raw.lastPathComponent,
+            finalOutputPath: final.path,
+            workDirectory: work,
+            environment: ["SCAN_LANGUAGE": "deu+eng"],
+            removeBlankPages: false,
+            cropPages: false
+        ))
+
+        try await queue.submitStreamingPage(
+            batchID: batchID,
+            page: ScanSnapAcquiredPage(pageNumber: 1, jpegData: Data([0xff, 0xd8, 0xff, 0xd9]))
+        )
+        await executor.waitForRequestCount(1)
+        try await queue.submitStreamingPage(
+            batchID: batchID,
+            page: ScanSnapAcquiredPage(pageNumber: 2, jpegData: Data([0xff, 0xd8, 0xff, 0xd9]))
+        )
+        try await queue.finishStreamingScan(batchID: batchID, pageCount: 2)
+
+        await queue.cancelJobs(referencing: raw.path)
+        await queue.waitUntilIdle()
+
+        #expect(await executor.requests().count == 1)
+        #expect(!FileManager.default.fileExists(atPath: work.path))
+        #expect(!FileManager.default.fileExists(atPath: final.path))
+        #expect(await queue.state.status == "cancelled")
+        #expect(await queue.state.queued == 0)
+        #expect(await queue.state.running == 0)
+    }
+
     @Test("Multipage jobs execute in FIFO order within one CPU budget")
     func fifo() async {
         let executor = FakeProcessExecutor(stubs: [
@@ -11,7 +437,7 @@ struct OCRQueueActorTests {
             .result(ProcessResult(exitStatus: 0, standardOutput: "/scans/two.ocr.pdf\n")),
             .result(ProcessResult(exitStatus: 0, standardOutput: "/scans/three.ocr.pdf\n")),
         ])
-        let queue = OCRQueueActor(executor: executor, configuration: serialOCRConfiguration)
+        let queue = OCRQueueActor(ocrExecutor: executor, configuration: serialOCRConfiguration)
 
         await queue.enqueue("/scans/one.pdf")
         await queue.enqueue("/scans/two.pdf")
@@ -58,7 +484,7 @@ struct OCRQueueActorTests {
             .result(ProcessResult(exitStatus: 0)),
         ])
         let queue = OCRQueueActor(
-            executor: executor,
+            ocrExecutor: executor,
             documentExecutor: executor,
             workspaceSuffixProvider: { "test" },
             configuration: serialOCRConfiguration
@@ -106,7 +532,7 @@ struct OCRQueueActorTests {
             .result(ProcessResult(exitStatus: 0)),
         ])
         let queue = OCRQueueActor(
-            executor: executor,
+            ocrExecutor: executor,
             documentExecutor: executor,
             workspaceSuffixProvider: { "processing-test" },
             configuration: serialOCRConfiguration
@@ -147,7 +573,7 @@ struct OCRQueueActorTests {
             .result(ProcessResult(exitStatus: 0)),
         ])
         let queue = OCRQueueActor(
-            executor: executor,
+            ocrExecutor: executor,
             documentExecutor: executor,
             workspaceSuffixProvider: { "nice-processing-test" },
             configuration: OCRQueueConfiguration(cpuLimit: 1, niceLevel: 10)
@@ -223,9 +649,12 @@ struct OCRQueueActorTests {
             workingDirectory: work
         )
         let queue = OCRQueueActor(
-            executor: executor,
+            ocrExecutor: executor,
             documentExecutor: executor,
-            configuration: serialOCRConfiguration
+            configuration: serialOCRConfiguration,
+            workerCapacityProvider: {
+                OCRQueueWorkerCapacity(internalCPULimit: 1, internalNiceLevel: 12)
+            }
         )
 
         await queue.enqueue(DeferredScanProcessing(
@@ -265,6 +694,308 @@ struct OCRQueueActorTests {
         #expect(await queue.state.recentJobs.count == 3)
     }
 
+    @Test("OCR-only deferred processing publishes only OCR pages and cleans raw work")
+    func deferredOCROnlyPublishesOCRPages() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "deferred-ocr-only-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent(".scan-work.test", isDirectory: true)
+        let input = work.appendingPathComponent("raw.pdf")
+        let prefix = "2026-08-13.205340"
+        let rawPage1 = work.appendingPathComponent("\(prefix)-page-0001.pdf")
+        let rawPage2 = work.appendingPathComponent("\(prefix)-page-0002.pdf")
+        let ocrPage1 = root.appendingPathComponent("\(prefix)-page-0001.ocr.pdf")
+        let ocrPage2 = root.appendingPathComponent("\(prefix)-page-0002.ocr.pdf")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        try Data("raw source".utf8).write(to: input)
+
+        let executor = FakeNativeScanProcessExecutor(stubs: [
+            .result(ProcessResult(exitStatus: 0)),
+            .result(ProcessResult(exitStatus: 0)),
+            .result(ProcessResult(exitStatus: 0)),
+            .materialize(
+                files: [
+                    rawPage1.path: Data("page one".utf8),
+                    rawPage2.path: Data("page two".utf8),
+                ],
+                result: ProcessResult(
+                    exitStatus: 0,
+                    standardOutput: "\(rawPage1.path)\n\(rawPage2.path)\n"
+                )
+            ),
+            .materialize(
+                files: [ocrPage1.path: Data("ocr one".utf8)],
+                result: ProcessResult(exitStatus: 0, standardOutput: "\(ocrPage1.path)\n")
+            ),
+            .materialize(
+                files: [ocrPage2.path: Data("ocr two".utf8)],
+                result: ProcessResult(exitStatus: 0, standardOutput: "\(ocrPage2.path)\n")
+            ),
+        ])
+        let environment = [
+            "SCAN_PAGE_MODE": "single",
+            "SCAN_LANGUAGE": "eng",
+        ]
+        let plan = DocumentProcessingPlan(
+            removeBlankPages: RemoveBlankPagesRequest(pdfPath: input.path),
+            cropPages: CropPDFPagesRequest(pdfPath: input.path),
+            creatorMetadata: SetPDFCreatorRequest(pdfPath: input.path),
+            finalOutput: .splitPDF(SplitPDFPagesRequest(
+                pdfPath: input.path,
+                outputDirectory: work.path,
+                prefix: try ScanTimestamp(rawValue: prefix)
+            )),
+            environment: environment,
+            workingDirectory: work
+        )
+        let queue = OCRQueueActor(
+            ocrExecutor: executor,
+            documentExecutor: executor,
+            configuration: serialOCRConfiguration
+        )
+
+        await queue.enqueue(DeferredScanProcessing(
+            inputPath: input.path,
+            cleanupDirectory: work,
+            plan: plan,
+            ocrEnabled: true,
+            ocrOnly: true
+        ))
+        await queue.waitUntilIdle()
+
+        let requests = await executor.requests()
+        #expect(requests.map(\.executable) == [
+            "remove-blank-pages",
+            "crop-pdf-pages",
+            "set-pdf-creator",
+            "split-pdf-pages",
+            "ocrmypdf",
+            "ocrmypdf",
+        ])
+        #expect(requests[3].arguments == [input.path, work.path, prefix])
+        #expect(requests[4].arguments == ocrArguments(
+            input: rawPage1.path,
+            output: ocrPage1.path,
+            language: "eng"
+        ))
+        #expect(requests[5].arguments == ocrArguments(
+            input: rawPage2.path,
+            output: ocrPage2.path,
+            language: "eng"
+        ))
+        #expect(try Data(contentsOf: ocrPage1) == Data("ocr one".utf8))
+        #expect(try Data(contentsOf: ocrPage2) == Data("ocr two".utf8))
+        #expect(!FileManager.default.fileExists(atPath: rawPage1.path))
+        #expect(!FileManager.default.fileExists(atPath: work.path))
+        #expect(await queue.state.status == "done")
+    }
+
+    @Test("OCR-only deferred page failure publishes the raw page as fallback")
+    func deferredOCROnlyPublishesRawPageFallbackOnFailure() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "deferred-ocr-only-fallback-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent(".scan-work.test", isDirectory: true)
+        let input = work.appendingPathComponent("raw.pdf")
+        let prefix = "2026-08-13.205341"
+        let rawPage1 = work.appendingPathComponent("\(prefix)-page-0001.pdf")
+        let rawPage2 = work.appendingPathComponent("\(prefix)-page-0002.pdf")
+        let fallbackPage1 = root.appendingPathComponent("\(prefix)-page-0001.pdf")
+        let ocrPage2 = root.appendingPathComponent("\(prefix)-page-0002.ocr.pdf")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        try Data("raw source".utf8).write(to: input)
+
+        let executor = FakeNativeScanProcessExecutor(stubs: [
+            .result(ProcessResult(exitStatus: 0)),
+            .materialize(
+                files: [
+                    rawPage1.path: Data("page one".utf8),
+                    rawPage2.path: Data("page two".utf8),
+                ],
+                result: ProcessResult(
+                    exitStatus: 0,
+                    standardOutput: "\(rawPage1.path)\n\(rawPage2.path)\n"
+                )
+            ),
+            .result(ProcessResult(exitStatus: 3, standardError: "tesseract failed\n")),
+            .materialize(
+                files: [ocrPage2.path: Data("ocr two".utf8)],
+                result: ProcessResult(exitStatus: 0, standardOutput: "\(ocrPage2.path)\n")
+            ),
+        ])
+        let plan = DocumentProcessingPlan(
+            creatorMetadata: SetPDFCreatorRequest(pdfPath: input.path),
+            finalOutput: .splitPDF(SplitPDFPagesRequest(
+                pdfPath: input.path,
+                outputDirectory: work.path,
+                prefix: try ScanTimestamp(rawValue: prefix)
+            )),
+            environment: ["SCAN_LANGUAGE": "eng"],
+            workingDirectory: work
+        )
+        let queue = OCRQueueActor(
+            ocrExecutor: executor,
+            documentExecutor: executor,
+            configuration: serialOCRConfiguration
+        )
+
+        await queue.enqueue(DeferredScanProcessing(
+            inputPath: input.path,
+            cleanupDirectory: work,
+            plan: plan,
+            ocrEnabled: true,
+            ocrOnly: true
+        ))
+        await queue.waitUntilIdle()
+
+        let requests = await executor.requests()
+        #expect(requests.map(\.executable) == [
+            "set-pdf-creator",
+            "split-pdf-pages",
+            "ocrmypdf",
+            "ocrmypdf",
+        ])
+        guard requests.count == 4 else { return }
+        #expect(requests[2].arguments == ocrArguments(
+            input: rawPage1.path,
+            output: ocrPage2.deletingLastPathComponent()
+                .appendingPathComponent("\(prefix)-page-0001.ocr.pdf").path,
+            language: "eng"
+        ))
+        #expect(FileManager.default.fileExists(atPath: fallbackPage1.path))
+        #expect(try Data(contentsOf: fallbackPage1) == Data("page one".utf8))
+        #expect(try Data(contentsOf: ocrPage2) == Data("ocr two".utf8))
+        #expect(!FileManager.default.fileExists(atPath: work.path))
+        let state = await queue.state
+        #expect(state.recentJobs.contains { $0.status == "failed (3)" })
+    }
+
+    @Test("OCR-only deferred output conflict retains the workspace when the raw page fallback cannot be published")
+    func deferredOCROnlyConflictRetainsWorkspace() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "deferred-ocr-only-conflict-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent(".scan-work.test", isDirectory: true)
+        let input = work.appendingPathComponent("raw.pdf")
+        let prefix = "2026-08-13.205400"
+        let rawPage1 = work.appendingPathComponent("\(prefix)-page-0001.pdf")
+        let existingOCRPage = root.appendingPathComponent("\(prefix)-page-0001.pdf")
+        let existingOCROutput = root.appendingPathComponent("\(prefix)-page-0001.ocr.pdf")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        try Data("raw source".utf8).write(to: input)
+        try Data("existing page".utf8).write(to: existingOCRPage)
+        try Data("existing ocr".utf8).write(to: existingOCROutput)
+
+        let executor = FakeNativeScanProcessExecutor(stubs: [
+            .result(ProcessResult(exitStatus: 0)),
+            .materialize(
+                files: [rawPage1.path: Data("page one".utf8)],
+                result: ProcessResult(exitStatus: 0, standardOutput: "\(rawPage1.path)\n")
+            ),
+        ])
+        let plan = DocumentProcessingPlan(
+            creatorMetadata: SetPDFCreatorRequest(pdfPath: input.path),
+            finalOutput: .splitPDF(SplitPDFPagesRequest(
+                pdfPath: input.path,
+                outputDirectory: work.path,
+                prefix: try ScanTimestamp(rawValue: prefix)
+            )),
+            environment: ["SCAN_LANGUAGE": "eng"],
+            workingDirectory: work
+        )
+        let queue = OCRQueueActor(
+            ocrExecutor: executor,
+            documentExecutor: executor,
+            configuration: serialOCRConfiguration
+        )
+
+        await queue.enqueue(DeferredScanProcessing(
+            inputPath: input.path,
+            cleanupDirectory: work,
+            plan: plan,
+            ocrEnabled: true,
+            ocrOnly: true
+        ))
+        await queue.waitUntilIdle()
+
+        #expect(await executor.requests().map(\.executable) == [
+            "set-pdf-creator", "split-pdf-pages",
+        ])
+        let state = await queue.state
+        #expect(state.recentJobs.contains { $0.status == "failed (73)" })
+        #expect(state.error.contains("OCR output file already exists"))
+        #expect(state.error.contains(work.path))
+        #expect(FileManager.default.fileExists(atPath: work.path))
+        #expect(try Data(contentsOf: existingOCRPage) == Data("existing page".utf8))
+        #expect(try Data(contentsOf: existingOCROutput) == Data("existing ocr".utf8))
+    }
+
+    @Test("OCR-only deferred page failure retains the workspace when the raw page fallback cannot be published")
+    func deferredOCROnlyFallbackPublicationFailureRetainsWorkspace() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "deferred-ocr-only-retention-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent(".scan-work.test", isDirectory: true)
+        let input = work.appendingPathComponent("raw.pdf")
+        let prefix = "2026-08-13.205401"
+        let rawPage1 = work.appendingPathComponent("\(prefix)-page-0001.pdf")
+        let existingPage = root.appendingPathComponent("\(prefix)-page-0001.pdf")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        try Data("raw source".utf8).write(to: input)
+        try Data("existing page".utf8).write(to: existingPage)
+
+        let executor = FakeNativeScanProcessExecutor(stubs: [
+            .result(ProcessResult(exitStatus: 0)),
+            .materialize(
+                files: [rawPage1.path: Data("page one".utf8)],
+                result: ProcessResult(exitStatus: 0, standardOutput: "\(rawPage1.path)\n")
+            ),
+            .result(ProcessResult(exitStatus: 3, standardError: "tesseract failed\n")),
+        ])
+        let plan = DocumentProcessingPlan(
+            creatorMetadata: SetPDFCreatorRequest(pdfPath: input.path),
+            finalOutput: .splitPDF(SplitPDFPagesRequest(
+                pdfPath: input.path,
+                outputDirectory: work.path,
+                prefix: try ScanTimestamp(rawValue: prefix)
+            )),
+            environment: ["SCAN_LANGUAGE": "eng"],
+            workingDirectory: work
+        )
+        let queue = OCRQueueActor(
+            ocrExecutor: executor,
+            documentExecutor: executor,
+            configuration: serialOCRConfiguration
+        )
+
+        await queue.enqueue(DeferredScanProcessing(
+            inputPath: input.path,
+            cleanupDirectory: work,
+            plan: plan,
+            ocrEnabled: true,
+            ocrOnly: true
+        ))
+        await queue.waitUntilIdle()
+
+        #expect(await executor.requests().map(\.executable) == [
+            "set-pdf-creator", "split-pdf-pages", "ocrmypdf",
+        ])
+        let state = await queue.state
+        #expect(state.recentJobs.contains { $0.status == "failed (3)" })
+        #expect(state.error.contains("tesseract failed"))
+        #expect(state.error.contains(work.path))
+        #expect(FileManager.default.fileExists(atPath: work.path))
+        #expect(try Data(contentsOf: existingPage) == Data("existing page".utf8))
+    }
+
     @Test("Deferred output conflicts retain status compatibility and clean work files")
     func deferredOutputConflict() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -295,7 +1026,7 @@ struct OCRQueueActorTests {
             workingDirectory: work
         )
         let queue = OCRQueueActor(
-            executor: executor,
+            ocrExecutor: executor,
             documentExecutor: executor,
             configuration: serialOCRConfiguration
         )
@@ -347,7 +1078,7 @@ struct OCRQueueActorTests {
             workingDirectory: work
         )
         let queue = OCRQueueActor(
-            executor: executor,
+            ocrExecutor: executor,
             documentExecutor: executor,
             configuration: serialOCRConfiguration
         )
@@ -390,7 +1121,7 @@ struct OCRQueueActorTests {
             workingDirectory: root
         )
         let queue = OCRQueueActor(
-            executor: executor,
+            ocrExecutor: executor,
             documentExecutor: executor,
             configuration: serialOCRConfiguration
         )
@@ -417,7 +1148,7 @@ struct OCRQueueActorTests {
         let output = root.appendingPathComponent("scan.ocr.pdf")
         try Data().write(to: output)
         let executor = FakeProcessExecutor(stubs: [])
-        let queue = OCRQueueActor(executor: executor, configuration: serialOCRConfiguration)
+        let queue = OCRQueueActor(ocrExecutor: executor, configuration: serialOCRConfiguration)
 
         await queue.enqueue(root.appendingPathComponent("scan.png").path)
         await queue.enqueue(input.path)
@@ -434,7 +1165,7 @@ struct OCRQueueActorTests {
             .result(ProcessResult(exitStatus: 73, standardError: "already exists\n")),
             .result(ProcessResult(exitStatus: 0, standardOutput: "/scans/two.ocr.pdf\n")),
         ])
-        let queue = OCRQueueActor(executor: executor, configuration: serialOCRConfiguration)
+        let queue = OCRQueueActor(ocrExecutor: executor, configuration: serialOCRConfiguration)
 
         await queue.enqueue("/scans/one.pdf")
         await queue.enqueue("/scans/two.pdf")
@@ -443,6 +1174,67 @@ struct OCRQueueActorTests {
         #expect(await executor.requests().count == 2)
         #expect(await queue.state.status == "done")
         #expect(await queue.state.input == "/scans/two.pdf")
+    }
+
+    @Test("OCR-only cancellation does not publish a fallback from a late failing process result")
+    func ocrOnlyCancellationDoesNotPublishLateFallback() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "cancelled-ocr-only-late-failure-tests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let work = root.appendingPathComponent(".scan-work.active", isDirectory: true)
+        let input = work.appendingPathComponent("raw.pdf")
+        let prefix = "2026-08-17.083700"
+        let rawPage = work.appendingPathComponent("\(prefix)-page-0001.pdf")
+        let publishedFallback = root.appendingPathComponent("\(prefix)-page-0001.pdf")
+        let publishedOCR = root.appendingPathComponent("\(prefix)-page-0001.ocr.pdf")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        try Data("raw document".utf8).write(to: input)
+        try Data("raw page".utf8).write(to: rawPage)
+
+        let executor = FakeProcessExecutor(stubs: [
+            .result(ProcessResult(exitStatus: 0)),
+            .result(ProcessResult(exitStatus: 0, standardOutput: rawPage.path + "\n")),
+            .suspendedIgnoringCancellation(ProcessResult(
+                exitStatus: 3,
+                standardError: "late OCR failure\n"
+            )),
+        ])
+        let queue = OCRQueueActor(
+            ocrExecutor: executor,
+            documentExecutor: executor,
+            configuration: serialOCRConfiguration
+        )
+        await queue.enqueue(DeferredScanProcessing(
+            inputPath: input.path,
+            cleanupDirectory: work,
+            plan: DocumentProcessingPlan(
+                creatorMetadata: SetPDFCreatorRequest(pdfPath: input.path),
+                finalOutput: .splitPDF(SplitPDFPagesRequest(
+                    pdfPath: input.path,
+                    outputDirectory: work.path,
+                    prefix: try ScanTimestamp(rawValue: prefix)
+                )),
+                environment: ["SCAN_LANGUAGE": "eng"],
+                workingDirectory: work
+            ),
+            ocrEnabled: true,
+            ocrOnly: true
+        ))
+
+        await executor.waitForRequestCount(3)
+        let cancellation = Task { await queue.cancelAll() }
+        await executor.waitForIgnoredCancellationCount(1)
+        try Data("partial late OCR output".utf8).write(to: publishedOCR)
+        await executor.resumeNextSuspendedExecution()
+        await cancellation.value
+        await queue.waitUntilIdle()
+
+        #expect(!FileManager.default.fileExists(atPath: publishedFallback.path))
+        #expect(!FileManager.default.fileExists(atPath: publishedOCR.path))
+        #expect(!FileManager.default.fileExists(atPath: work.path))
+        #expect(await queue.state.status == "cancelled")
     }
 
     @Test("Cancellation stops the worker and clears queued jobs")
@@ -460,7 +1252,7 @@ struct OCRQueueActorTests {
         let executor = FakeProcessExecutor(stubs: [
             .suspended(ProcessResult(exitStatus: 0)),
         ])
-        let queue = OCRQueueActor(executor: executor, configuration: serialOCRConfiguration)
+        let queue = OCRQueueActor(ocrExecutor: executor, configuration: serialOCRConfiguration)
         let deferred = DeferredScanProcessing(
             inputPath: input.path,
             cleanupDirectory: work,
@@ -513,7 +1305,7 @@ struct OCRQueueActorTests {
             .result(ProcessResult(exitStatus: 0)),
         ])
         let queue = OCRQueueActor(
-            executor: executor,
+            ocrExecutor: executor,
             documentExecutor: executor,
             configuration: serialOCRConfiguration
         )
@@ -553,7 +1345,7 @@ struct OCRQueueActorTests {
             .suspended(ProcessResult(exitStatus: 0)),
             .result(ProcessResult(exitStatus: 0, standardOutput: "/scans/two.ocr.pdf\n")),
         ])
-        let queue = OCRQueueActor(executor: executor, configuration: serialOCRConfiguration)
+        let queue = OCRQueueActor(ocrExecutor: executor, configuration: serialOCRConfiguration)
 
         await queue.enqueue("/scans/one.pdf")
         await queue.enqueue("/scans/two.pdf")
@@ -561,10 +1353,11 @@ struct OCRQueueActorTests {
         await queue.cancelJobs(referencing: "/scans/one.pdf")
         await queue.waitUntilIdle()
 
+        let state = await queue.state
         #expect(await executor.requests().count == 2)
-        #expect(await queue.state.status == "done")
-        #expect(await queue.state.input == "/scans/two.pdf")
-        #expect(await queue.state.recentJobs.map(\.status) == ["done", "cancelled"])
+        #expect(state.status == "done")
+        #expect(state.input == "/scans/two.pdf")
+        #expect(state.recentJobs.map(\.status) == ["done", "cancelled"])
     }
 
     @Test("Cancelling a queued job by its output path leaves the active job running")
@@ -572,7 +1365,19 @@ struct OCRQueueActorTests {
         let executor = FakeProcessExecutor(stubs: [
             .suspended(ProcessResult(exitStatus: 0, standardOutput: "/scans/one.ocr.pdf\n")),
         ])
-        let queue = OCRQueueActor(executor: executor, configuration: serialOCRConfiguration)
+        let capacity = OCRLocalCapacityPool(capacity: 1)
+        let module = OCRExecutionModule(
+            local: executor,
+            workers: OCRWorkerRegistry(),
+            jobs: OCRWorkerJobStore(),
+            localCapacity: capacity,
+            configuration: DistributedOCRConfiguration(enabled: false)
+        )
+        let queue = OCRQueueActor(
+            ocrExecutor: module,
+            configuration: serialOCRConfiguration,
+            localCapacity: capacity
+        )
 
         await queue.enqueue("/scans/one.pdf")
         await executor.waitForRequestCount(1)
@@ -581,7 +1386,8 @@ struct OCRQueueActorTests {
         await executor.resumeNextSuspendedExecution()
         await queue.waitUntilIdle()
 
-        #expect(await executor.requests().count == 1)
+        let requestCount = await executor.requests().count
+        #expect(requestCount == 1)
         #expect(await queue.state.status == "done")
         #expect(await queue.state.input == "/scans/one.pdf")
         #expect(await queue.state.queued == 0)
@@ -596,7 +1402,7 @@ struct OCRQueueActorTests {
             .suspended(ProcessResult(exitStatus: 0)),
         ])
         let queue = OCRQueueActor(
-            executor: executor,
+            ocrExecutor: executor,
             configuration: OCRQueueConfiguration(cpuLimit: 3, niceLevel: 10)
         )
         let environment = ["SCAN_PAGE_MODE": "single"]
@@ -626,19 +1432,94 @@ struct OCRQueueActorTests {
         #expect(await queue.state.queued == 0)
     }
 
-    @Test("A saved CPU limit controls multipage OCRmyPDF workers")
+    @Test("Remote worker slots are added to the optional internal OCR capacity")
+    func aggregateWorkerConcurrency() async {
+        let executor = FakeProcessExecutor(stubs: Array(
+            repeating: .suspended(ProcessResult(exitStatus: 0)),
+            count: 18
+        ))
+        let capacity = TestWorkerCapacityProvider(
+            OCRQueueWorkerCapacity(remoteJobSlots: 14, internalOCREnabled: false)
+        )
+        let queue = OCRQueueActor(
+            ocrExecutor: executor,
+            configuration: OCRQueueConfiguration(cpuLimit: 3),
+            workerCapacityProvider: { await capacity.value }
+        )
+        let environment = ["SCAN_PAGE_MODE": "single"]
+
+        for page in 1...18 {
+            await queue.enqueue("/scans/page-\(page).pdf", environment: environment)
+        }
+        await executor.waitForRequestCount(14)
+
+        #expect(await queue.state.running == 14)
+        #expect(await queue.state.queued == 4)
+
+        await capacity.set(
+            OCRQueueWorkerCapacity(remoteJobSlots: 14, internalOCREnabled: true)
+        )
+        await queue.capacityDidChange()
+        await executor.waitForRequestCount(17)
+
+        #expect(await queue.state.running == 17)
+        #expect(await queue.state.queued == 1)
+        let requests = await executor.ocrRequests()
+        #expect(requests.filter { $0.dispatchPreference == .remoteFirst }.count == 14)
+        #expect(requests.filter { $0.dispatchPreference == .reservedInternal }.count == 3)
+
+        await queue.cancelAll()
+    }
+
+    @Test("Fallback-only internal worker waits while remote capacity is available")
+    func fallbackOnlyWorkerConcurrency() async {
+        let executor = FakeProcessExecutor(stubs: Array(
+            repeating: .suspended(ProcessResult(exitStatus: 0)),
+            count: 8
+        ))
+        let queue = OCRQueueActor(
+            ocrExecutor: executor,
+            configuration: OCRQueueConfiguration(cpuLimit: 3),
+            workerCapacityProvider: {
+                OCRQueueWorkerCapacity(
+                    remoteJobSlots: 4,
+                    internalOCREnabled: true,
+                    internalOCRFallbackOnly: true
+                )
+            }
+        )
+        let environment = ["SCAN_PAGE_MODE": "single"]
+
+        for page in 1...8 {
+            await queue.enqueue("/scans/page-\(page).pdf", environment: environment)
+        }
+        await executor.waitForRequestCount(4)
+
+        #expect(await queue.state.running == 4)
+        #expect(await queue.state.queued == 4)
+        #expect(await executor.ocrRequests().allSatisfy {
+            $0.dispatchPreference == .remoteFirst
+        })
+
+        await queue.cancelAll()
+    }
+
+    @Test("The internal worker CPU limit controls multipage OCRmyPDF workers")
     func multipageCPULimit() async {
         let executor = FakeProcessExecutor(stubs: [
             .result(ProcessResult(exitStatus: 0, standardOutput: "/scans/one.ocr.pdf\n")),
         ])
         let queue = OCRQueueActor(
-            executor: executor,
-            configuration: OCRQueueConfiguration(cpuLimit: 8, niceLevel: nil)
+            ocrExecutor: executor,
+            configuration: OCRQueueConfiguration(cpuLimit: 8, niceLevel: nil),
+            workerCapacityProvider: {
+                OCRQueueWorkerCapacity(internalCPULimit: 3)
+            }
         )
 
         await queue.enqueue(
             "/scans/one.pdf",
-            environment: ["SCAN_OCR_CPU_LIMIT": "3"]
+            environment: ["SCAN_OCR_CPU_LIMIT": "7"]
         )
         await queue.waitUntilIdle()
 
@@ -647,7 +1528,7 @@ struct OCRQueueActorTests {
         #expect(argumentValue("--jobs", in: request?.arguments ?? []) == "3")
     }
 
-    @Test("A saved OCR priority overrides the queue default", arguments: [
+    @Test("The internal worker priority overrides legacy preset values", arguments: [
         (
             queueNiceLevel: Optional(10),
             modeNice: "false",
@@ -657,7 +1538,7 @@ struct OCRQueueActorTests {
         (
             queueNiceLevel: Optional<Int>.none,
             modeNice: "true",
-            expectedNiceLevel: Optional(15),
+            expectedNiceLevel: Optional(12),
             expectedExecutable: "ocrmypdf"
         ),
     ])
@@ -671,8 +1552,14 @@ struct OCRQueueActorTests {
             .result(ProcessResult(exitStatus: 0, standardOutput: "/scans/one.ocr.pdf\n")),
         ])
         let queue = OCRQueueActor(
-            executor: executor,
-            configuration: OCRQueueConfiguration(cpuLimit: 1, niceLevel: queueNiceLevel)
+            ocrExecutor: executor,
+            configuration: OCRQueueConfiguration(cpuLimit: 1, niceLevel: queueNiceLevel),
+            workerCapacityProvider: {
+                OCRQueueWorkerCapacity(
+                    internalCPULimit: 1,
+                    internalNiceLevel: expectedNiceLevel
+                )
+            }
         )
 
         var environment = ["SCAN_OCR_NICE": modeNice]
@@ -686,7 +1573,7 @@ struct OCRQueueActorTests {
         #expect(await queue.state.niceLevel == expectedNiceLevel)
     }
 
-    @Test("A saved CPU limit caps parallel pages from one scan")
+    @Test("The internal worker CPU limit caps parallel pages from one scan")
     func singlePageBatchCPULimit() async {
         let executor = FakeProcessExecutor(stubs: [
             .suspended(ProcessResult(exitStatus: 0)),
@@ -695,13 +1582,16 @@ struct OCRQueueActorTests {
             .suspended(ProcessResult(exitStatus: 0)),
         ])
         let queue = OCRQueueActor(
-            executor: executor,
-            configuration: OCRQueueConfiguration(cpuLimit: 4, niceLevel: nil)
+            ocrExecutor: executor,
+            configuration: OCRQueueConfiguration(cpuLimit: 4, niceLevel: nil),
+            workerCapacityProvider: {
+                OCRQueueWorkerCapacity(internalCPULimit: 2)
+            }
         )
         let batchID = UUID()
         let environment = [
             "SCAN_PAGE_MODE": "single",
-            "SCAN_OCR_CPU_LIMIT": "2",
+            "SCAN_OCR_CPU_LIMIT": "4",
         ]
 
         await queue.enqueue("/scans/one.pdf", batchID: batchID, environment: environment)
@@ -712,6 +1602,8 @@ struct OCRQueueActorTests {
 
         #expect(await queue.state.running == 2)
         #expect(await queue.state.queued == 2)
+        #expect(await queue.state.processingJobs.count == 2)
+        #expect(await queue.state.waitingJobs.map(\.documentName) == ["three.pdf", "four.pdf"])
 
         await executor.resumeNextSuspendedExecution()
         await executor.waitForRequestCount(3)
@@ -722,7 +1614,52 @@ struct OCRQueueActorTests {
     }
 }
 
+private actor SuspendingStreamingPagePDFWriter: StreamingPagePDFWriting {
+    private var writeCount = 0
+    private var secondWriteIsSuspended = false
+    private var secondWriteContinuation: CheckedContinuation<Void, Never>?
+    private var secondWriteWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func write(pages: [Data], to outputURL: URL) async throws {
+        try await ScanSnapPDFWriter().write(pages: pages, to: outputURL)
+        writeCount += 1
+        guard writeCount == 2 else { return }
+        await withCheckedContinuation { continuation in
+            secondWriteContinuation = continuation
+            secondWriteIsSuspended = true
+            let waiters = secondWriteWaiters
+            secondWriteWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+        }
+    }
+
+    func waitUntilSecondWriteIsSuspended() async {
+        guard !secondWriteIsSuspended else { return }
+        await withCheckedContinuation { continuation in
+            secondWriteWaiters.append(continuation)
+        }
+    }
+
+    func resumeSecondWrite() {
+        secondWriteContinuation?.resume()
+        secondWriteContinuation = nil
+        secondWriteIsSuspended = false
+    }
+}
+
 private let serialOCRConfiguration = OCRQueueConfiguration(cpuLimit: 1, niceLevel: nil)
+
+private actor TestWorkerCapacityProvider {
+    private(set) var value: OCRQueueWorkerCapacity
+
+    init(_ value: OCRQueueWorkerCapacity) {
+        self.value = value
+    }
+
+    func set(_ value: OCRQueueWorkerCapacity) {
+        self.value = value
+    }
+}
 
 private func ocrArguments(
     input: String,

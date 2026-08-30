@@ -1,47 +1,18 @@
 import Foundation
 
-public enum ScanPipelineCommands {
-    public static func ocr(
-        inputPath: String,
-        outputPath: String? = nil,
-        environment: [String: String]? = nil,
-        workingDirectory: URL? = nil,
-        jobs: Int? = nil,
-        niceLevel: Int? = nil
-    ) -> ProcessRequest {
-        let language = environment?["SCAN_LANGUAGE"] ?? "deu+eng"
-        let rotatePagesThreshold = environment?["SCAN_OCR_ROTATE_PAGES_THRESHOLD"] ?? "2.0"
-        var arguments = [
-            "--language", language,
-            "--rotate-pages",
-            "--rotate-pages-threshold", rotatePagesThreshold,
-            "--deskew",
-            "--optimize", "1",
-        ]
-        if let jobs {
-            arguments += ["--jobs", String(max(1, jobs))]
-        }
-        arguments += [
-            inputPath,
-            outputPath ?? OCRInputPath.outputPath(for: inputPath) ?? inputPath,
-        ]
-        return ProcessRequest(
-            executable: "ocrmypdf",
-            arguments: arguments,
-            environment: environment,
-            workingDirectory: workingDirectory,
-            niceLevel: niceLevel
-        )
-    }
-
-}
-
 public enum OCRInputPath {
     public static func outputPath(for inputPath: String) -> String? {
         guard inputPath.hasSuffix(".pdf"), !inputPath.hasSuffix(".ocr.pdf") else {
             return nil
         }
         return String(inputPath.dropLast(4)) + ".ocr.pdf"
+    }
+
+    public static func outputPath(for inputPath: String, in outputDirectory: String) -> String? {
+        guard let relative = outputPath(for: inputPath) else { return nil }
+        return URL(fileURLWithPath: outputDirectory)
+            .appendingPathComponent(URL(fileURLWithPath: relative).lastPathComponent)
+            .path
     }
 }
 

@@ -4,13 +4,16 @@ import JLog
 public actor ScannerServerRuntime {
     public nonisolated let dependencies: ScannerServerDependencies
     private let buttonRuntime: (any ScanSnapButtonRuntimeControlling)?
+    private let ocrWorkerBonjourPublisher: OCRWorkerBonjourPublisher?
 
     public init(
         dependencies: ScannerServerDependencies,
-        buttonRuntime: (any ScanSnapButtonRuntimeControlling)? = nil
+        buttonRuntime: (any ScanSnapButtonRuntimeControlling)? = nil,
+        ocrWorkerBonjourPublisher: OCRWorkerBonjourPublisher? = nil
     ) {
         self.dependencies = dependencies
         self.buttonRuntime = buttonRuntime
+        self.ocrWorkerBonjourPublisher = ocrWorkerBonjourPublisher
     }
 
     public static func live(
@@ -28,11 +31,23 @@ public actor ScannerServerRuntime {
         )
         return ScannerServerRuntime(
             dependencies: dependencies,
-            buttonRuntime: buttonRuntime
+            buttonRuntime: buttonRuntime,
+            ocrWorkerBonjourPublisher: OCRWorkerBonjourPublisher(environment: environment)
         )
     }
 
     public func run(configuration: ScannerServerServiceConfiguration) async throws {
+        do {
+            let cancelledJobs = try await dependencies.ocrWorkerJobs.cancelNonterminalJobs()
+            if cancelledJobs > 0 {
+                JLog.warning(
+                    "Cancelled \(cancelledJobs) orphaned remote OCR job(s) left by the previous server process"
+                )
+                await dependencies.webUpdates.notify()
+            }
+        } catch {
+            JLog.warning("Could not cancel orphaned remote OCR jobs: \(error.localizedDescription)")
+        }
         let application = try ScannerServerApplication.make(
             configuration: configuration,
             dependencies: dependencies
@@ -43,6 +58,7 @@ public actor ScannerServerRuntime {
             )
         }
         await startButtonRuntime()
+        await ocrWorkerBonjourPublisher?.start(serviceConfiguration: configuration)
         do {
             try await application.runService()
         } catch {
@@ -61,6 +77,7 @@ public actor ScannerServerRuntime {
     }
 
     public func shutdown() async {
+        await ocrWorkerBonjourPublisher?.stop()
         await buttonRuntime?.stop()
         await dependencies.scannerSetup.shutdown()
         await dependencies.scanJobs.cancel()

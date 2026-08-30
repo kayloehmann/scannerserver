@@ -1,3 +1,4 @@
+import Foundation
 import ScannerServerCore
 
 enum FakeProcessError: Error, Sendable {
@@ -5,12 +6,30 @@ enum FakeProcessError: Error, Sendable {
     case missingStub
 }
 
+struct ProcessBackedOCRExecutor: OCRExecuting, Sendable {
+    let processExecutor: any ProcessExecutor
+
+    init(_ processExecutor: any ProcessExecutor) {
+        self.processExecutor = processExecutor
+    }
+
+    func execute(_ request: OCRExecutionRequest) async throws -> OCRExecutionResult {
+        try await LocalOCRProcessAdapter(
+            processExecutor: processExecutor,
+            documentExecutor: processExecutor
+        ).execute(request)
+    }
+}
+
 actor FakeProcessExecutor: ProcessExecutor {
     enum Stub: Sendable {
         case result(ProcessResult)
+        case materializeLastArgument(Data, ProcessResult)
+        case suspendedMaterializeLastArgument(Data, ProcessResult)
         case failure(FakeProcessError)
         case suspended(ProcessResult)
         case suspendedIgnoringCancellation(ProcessResult)
+        case suspendedIgnoringCancellationMaterializeLastArgument(Data, ProcessResult)
     }
 
     private struct RequestWaiter {
@@ -20,13 +39,16 @@ actor FakeProcessExecutor: ProcessExecutor {
 
     private var stubs: [Stub]
     private var recordedRequests: [ProcessRequest] = []
+    private var recordedOCRRequests: [OCRExecutionRequest] = []
+    private let ocrLocation: OCRExecutionLocation
     private var suspendedExecutions: [CheckedContinuation<Void, any Error>] = []
     private var requestWaiters: [RequestWaiter] = []
     private var ignoredCancellationCount = 0
     private var ignoredCancellationWaiters: [RequestWaiter] = []
 
-    init(stubs: [Stub]) {
+    init(stubs: [Stub], ocrLocation: OCRExecutionLocation = .local) {
         self.stubs = stubs
+        self.ocrLocation = ocrLocation
     }
 
     func execute(_ request: ProcessRequest) async throws -> ProcessResult {
@@ -37,6 +59,22 @@ actor FakeProcessExecutor: ProcessExecutor {
         let stub = stubs.removeFirst()
         switch stub {
         case .result(let result):
+            return result
+        case let .materializeLastArgument(data, result):
+            guard let path = request.arguments.last else { throw FakeProcessError.expectedFailure }
+            try data.write(to: URL(fileURLWithPath: path))
+            return result
+        case let .suspendedMaterializeLastArgument(data, result):
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    suspendedExecutions.append(continuation)
+                }
+            } onCancel: {
+                Task { await self.cancelNextSuspendedExecution() }
+            }
+            try Task.checkCancellation()
+            guard let path = request.arguments.last else { throw FakeProcessError.expectedFailure }
+            try data.write(to: URL(fileURLWithPath: path))
             return result
         case .failure(let error):
             throw error
@@ -59,11 +97,26 @@ actor FakeProcessExecutor: ProcessExecutor {
                 Task { await self.recordIgnoredCancellation() }
             }
             return result
+        case let .suspendedIgnoringCancellationMaterializeLastArgument(data, result):
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    suspendedExecutions.append(continuation)
+                }
+            } onCancel: {
+                Task { await self.recordIgnoredCancellation() }
+            }
+            guard let path = request.arguments.last else { throw FakeProcessError.expectedFailure }
+            try data.write(to: URL(fileURLWithPath: path))
+            return result
         }
     }
 
     func requests() -> [ProcessRequest] {
         recordedRequests
+    }
+
+    func ocrRequests() -> [OCRExecutionRequest] {
+        recordedOCRRequests
     }
 
     func waitForRequestCount(_ count: Int) async {
@@ -112,5 +165,28 @@ actor FakeProcessExecutor: ProcessExecutor {
         for waiter in satisfied {
             waiter.continuation.resume()
         }
+    }
+}
+
+extension FakeProcessExecutor: OCRExecuting {
+    func execute(_ request: OCRExecutionRequest) async throws -> OCRExecutionResult {
+        recordedOCRRequests.append(request)
+        if ocrLocation == .local {
+            return try await LocalOCRProcessAdapter(
+                processExecutor: self,
+                documentExecutor: self
+            ).execute(request)
+        }
+
+        let result = try await execute(LocalOCRProcessAdapter(
+            processExecutor: self,
+            documentExecutor: self
+        ).processRequest(for: request))
+        return OCRExecutionResult(
+            outcome: result.succeeded ? .succeeded : .failed(exitStatus: result.exitStatus),
+            standardOutput: result.standardOutput,
+            standardError: result.standardError,
+            location: ocrLocation
+        )
     }
 }

@@ -16,6 +16,11 @@ public struct OCRQueueConfiguration: Equatable, Sendable {
         )
     }
 
+    /// The processor allowance visible to this process after cgroup quota and cpuset limits.
+    public static var detectedProcessorCount: Int {
+        OCRSystemProcessorCount.detect()
+    }
+
     init(environment: [String: String], detectedProcessorCount: Int) {
         let detectedProcessorCount = max(1, detectedProcessorCount)
         let backgroundProcessorCount = max(1, detectedProcessorCount - 1)
@@ -36,17 +41,6 @@ public struct OCRQueueConfiguration: Equatable, Sendable {
         } else {
             niceLevel = nil
         }
-    }
-
-    func niceLevel(for environment: [String: String]?) -> Int? {
-        guard let requestedMode = environment?["SCAN_OCR_NICE"] else {
-            return niceLevel
-        }
-        guard Self.isTruthy(requestedMode) else { return nil }
-
-        let requestedLevel = Self.nonEmpty(environment?["SCAN_OCR_NICE_LEVEL"])
-            .flatMap(Int.init) ?? niceLevel ?? 10
-        return min(max(requestedLevel, 1), 19)
     }
 
     private static func isTruthy(_ value: String) -> Bool {

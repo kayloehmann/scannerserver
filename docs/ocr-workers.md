@@ -1,0 +1,285 @@
+---
+title: Distributed OCR Workers
+description: Running and operating optional Linux-container and macOS OCR workers for scannerserver.
+type: reference
+audience: maintainers and operators
+status: current
+---
+
+# Distributed OCR Workers
+
+The distributed OCR feature keeps scannerserver authoritative for scanning, queue ownership,
+filenames, cancellation, and final publication. Optional workers register from other computers and
+claim leased OCR jobs. Workers initiate every connection so they
+do not need a fixed address or an inbound firewall rule.
+
+## How It Works
+
+- The `scannerserver-worker` Swift executable connects to an explicit scannerserver URL or discovers
+  `_scannerserver._tcp` through Bonjour on macOS.
+- After resolving command-line configuration, identity, and the server URL, the executable composes
+  separate control and job HTTP clients plus the job processor and hands the long-running lifecycle
+  to `OCRWorkerRuntimeModule` in `ScannerServerCore`. That module owns registration/reconnects,
+  approval and disabled waiting, heartbeat supervision, lease dispatch, job activity accounting,
+  and approved-session cancellation/recovery. The executable therefore has no independent session
+  or leasing loop.
+- Each worker creates a persistent ID and authentication token in
+  `~/.config/scannerserver-worker/identity.json`.
+- Registration reports its name, hostname, architecture, CPU capacity, derived concurrency limit,
+  version, and OCR languages.
+- New workers require approval on the scannerserver **Workers** page.
+- The same page owns the built-in worker's persisted processing CPU allowance and post-scan
+  priority: **Normal**, **Niced**, or **Fallback only**. These are worker-wide settings, not
+  scan-preset fields, and selector changes apply immediately.
+- Heartbeats report liveness and running-job count. Approved workers become offline after missed
+  heartbeats. They can be paused temporarily or disabled without forgetting their approval.
+- Registrations and approvals are stored atomically in
+  `/scans/.scannerserver-ocr-workers.json` by default.
+- `OCRWorkerJobStore` provides an atomically persisted manifest and lease state machine at
+  `/scans/.scannerserver-ocr-jobs.json`. It supports FIFO capability matching, opaque lease tokens,
+  renewal, authenticated terminal transitions, and cancellation. Nonterminal manifests are
+  cancelled at scannerserver startup because their owning in-memory queue tasks do not survive a
+  restart; this prevents abandoned pages from being leased again.
+- `OCRWorkerJobTransferCoordinator` keeps the HTTP layer out of lease and file-publication policy.
+  It combines registry authorization with leasing, source path and digest checks, renewal and
+  failure transitions, and validated result staging. If cancellation or reassignment changes a
+  lease while a result is being validated, the coordinator removes any just-published result and
+  preserves the newer durable job state.
+- `OCRQueueActor` creates typed OCR requests and gives approved, enabled, compatible workers first
+  refusal through `OCRExecutionModule`,
+  including when a registered worker is temporarily offline. Capability-aware workers run OCR,
+  configured autocrop, and blank-page filtering on each page. It retains FIFO admission, local and
+  remote capacity selection, page-task cancellation, and timing. `StreamingOCRDocumentModule`
+  receives typed page completions and owns the all-blank keep-one safeguard, naming, ordered
+  assembly, verification, origin-specific failure policy, final publication, and workspace cleanup.
+  Its finalizer creates only a private staging file; an actor generation check guards the exclusive
+  publication commit against cancellation and late results.
+- The OCR scheduler fills the aggregate page capacity announced by all online, approved, enabled,
+  unpaused workers. With **Normal** or **Niced** priority, the internal worker's local CPU allowance
+  is added to that total after remote slots are filled. With **Fallback only**, local slots are not
+  reserved while compatible remote capacity is online; local niced processing is used when no
+  remote capacity is available or a remote attempt fails. Pausing the internal worker removes local
+  fallback altogether without reducing remote concurrency.
+  Local fallback and queue-owned preprocessing use one shared CPU permit pool. The queue releases
+  preprocessing capacity at the typed OCR handoff and the execution module acquires and releases
+  the local OCR reservation, so a worker outage cannot oversubscribe the scanner host.
+- Multipage ScanSnap Wi-Fi scans are streamed page by page. Each accepted JPEG is reserved by the
+  document actor before asynchronous PDF writing, then wrapped in a one-page PDF and queued before
+  the scanner transfers the next page. Completed one-page OCR,
+  crop, and blank-filter results are uploaded immediately, retained in the scan workspace, and
+  assembled in source order after the feeder is empty. With `SCAN_OCR_ONLY`, the raw `.pdf` stays
+  private and is removed once the assembled `.ocr.pdf` is published; if processing fails it is
+  published as a fallback instead, and a fallback that cannot be published keeps the workspace and
+  reports the error. Without it, the raw `.pdf` is published independently and only
+  the all-blank safeguard, creator metadata, and atomic `.ocr.pdf` publication happen after ordered
+  assembly.
+  The SANE backend remains whole-document because `scanimage` does not expose the same page-arrival
+  callback.
+- PDFs dropped onto the Documents page are counted and split by the same document module. Each
+  prepared page is yielded immediately to the queue and dispatched through the same aggregate
+  remote capacity. The uploaded source remains unchanged while completed pages are reassembled in
+  order as the sibling `.ocr.pdf`.
+- The worker downloads a size- and SHA-256-verified PDF, runs OCRmyPDF plus the native autocrop and
+  blank-page implementations directly in worker-container mode or inside the existing image with Apple
+  `container` in native macOS mode, and uploads the result through its authenticated lease.
+- scannerserver requires a PDF result, calculates its SHA-256 digest, writes it to a same-directory
+  staging file, validates it with `qpdf --check`, and atomically publishes the established
+  `.ocr.pdf` output name.
+- No approved and enabled compatible worker, assignment timeout, or reported worker failure falls
+  back to local OCR and the same typed crop/blank operations. Cancellation invalidates the remote
+  lease and is never converted into local fallback.
+- A worker uses one long-polling lease request at a time and starts page-processing tasks until its
+  announced capacity is full. Registration and heartbeats use a separate HTTP session, so many CPU
+  slots cannot occupy every connection and make a healthy worker appear stale. The approved-session
+  task owns its heartbeat, dispatcher, and in-flight job children as one cancellation tree: a failed
+  heartbeat, pause/disable transition, or process cancellation stops the lease poll and every active
+  page before the registration loop recovers the session. Individual job failures remain logged and
+  reported without terminating other pages or the dispatcher.
+
+## Run A Worker Container
+
+The production image contains both `scannerserver` and `scannerserver-worker`. Start the worker by
+overriding the image's default command:
+
+```sh
+docker run -d \
+  --name scannerserver-worker \
+  --restart unless-stopped \
+  --cpus 11 \
+  --memory 8g \
+  --volume scannerserver-worker-state:/home/scansnap/.config/scannerserver-worker \
+  gitmaster.jinx.eu/jnxpublic/scannerserver:jinx \
+  scannerserver-worker \
+  --server http://SCANNERSERVER-IP \
+  --name "Mac Studio"
+```
+
+The image enables direct execution automatically: OCRmyPDF runs inside the worker container, so no
+Docker socket, privileged mode, or nested container is needed. The worker detects Docker's cgroup
+CPU allowance; `--cpus 11` therefore advertises and uses 11 CPUs. Its named volume retains the
+worker identity and scannerserver approval when the container is replaced.
+
+If scannerserver is another container on the same Docker network, use its service name in
+`--server`. To reach a scannerserver published on the Docker host, use
+`http://host.docker.internal:PORT` on Docker Desktop.
+
+### Managed Apple Container worker on macOS
+
+macOS users running the complete worker image through Apple's `container` CLI can use the included
+launcher. It pulls and recreates the worker on demand, persists its identity in the user's Library,
+and can install a LaunchAgent that starts the existing container at login:
+
+```sh
+export SCANNERSERVER_WORKER_SERVER_URL=http://SCANNERSERVER-IP
+./scripts/scannerserverworker.zsh
+./scripts/scannerserverworker.zsh --install
+```
+
+Run the first command once before installing the LaunchAgent. It starts Apple Container with kernel
+installation enabled, pulls the configured image, and creates the worker. The LaunchAgent starts
+that existing container at later logins; it deliberately does not pull or replace images during
+login. Rerun the launcher without an option when a new scannerserver image should replace the
+worker container, then rerun `--install` only if its recorded settings changed.
+
+The LaunchAgent records the resolved settings, so it does not depend on interactive shell startup
+files. By default, the launcher uses the Mac's local host name, reserves one active CPU for macOS,
+allocates 8 GB to the worker container, and stores the persistent identity under
+`~/Library/Application Support/scannerserver-worker/`. Override those defaults before running the
+launcher or installing the LaunchAgent:
+
+```sh
+export SCANNERSERVER_WORKER_NAME=office-mac
+export SCANNERSERVER_WORKER_CPUS=8
+export SCANNERSERVER_WORKER_MEMORY=12G
+export SCANNERSERVER_WORKER_IMAGE=ghcr.io/jollyjinx/scannerserver:latest
+```
+
+Run `./scripts/scannerserverworker.zsh --help` for every override and `--dry-run` to inspect the
+resolved `container run` command. The launcher deliberately keeps transient OCR work under the
+container's `/tmp`; only the generated worker ID and authentication token are persisted on the Mac.
+The LaunchAgent stores the launcher's absolute path, so keep the checkout at that path after
+installation. Its combined output is written to
+`~/Library/Logs/eu.jinx.scannerserver-worker.log`.
+
+Open the **Workers** page on scannerserver and approve the new worker. Worker capacity is derived
+from its detected CPUs: an 11-CPU worker leases up to 11 pages concurrently, and every one-page PDF
+runs with one CPU and OCRmyPDF `--jobs 1`. This keeps every CPU busy across pages instead of assigning
+idle parallel-page capacity to a one-page PDF. The page includes the scannerserver's internal fallback worker,
+highlights processing workers, reports successful page count and average pages per minute, and shows
+waiting, running, and recent terminal work in compact lists with document, page, operations, worker,
+timing, and result details.
+
+**Pause** temporarily removes a remote worker from dispatch and immediately returns its active
+leases to the queue. Another compatible worker can claim them without waiting for lease expiry. The
+paused process remains registered and continues heartbeating; if it is still processing an old
+lease, its next renewal or upload is rejected and that work is discarded. **Resume** makes it
+eligible again. **Disable** remains the administrative off switch.
+
+The internal worker has its own **Pause** and **Resume** controls. Pausing it cancels active local
+OCR and keeps that page in the scheduler so a compatible remote worker can take over. While it is
+paused, new remote registrations and approvals are detected immediately; if no remote capacity is
+available, work waits instead of consuming scannerserver CPU. Resuming permits local fallback
+again. This state survives a scannerserver restart. Worker activity refreshes only the live Workers
+panel and preserves an active settings control; CPU and priority changes are posted immediately
+without a separate Save action.
+
+Deleting a worker removes its persisted registration and approval. If that worker process is still
+running, it registers again with the same identity and must be approved again.
+
+Deleting a document cancels its whole streaming batch, removes queued pages, invalidates active
+remote leases, and removes the private scan workspace. A late result from a worker is rejected and
+cannot recreate the deleted document.
+
+## Native macOS Worker
+
+The native executable remains useful when Apple Container should isolate each OCR job. Start the
+Apple Container system, pull the OCR image, and run the worker from this repository:
+
+```sh
+container system start
+container system kernel set --recommended  # only when no default kernel is configured
+container image pull gitmaster.jinx.eu/jnxpublic/scannerserver:jinx
+swift run -c release scannerserver-worker \
+  --server http://SCANNERSERVER-IP \
+  --name "Mac Studio" \
+  --cpus 11 \
+  --container-image gitmaster.jinx.eu/jnxpublic/scannerserver:jinx \
+  --memory-per-job 8G
+```
+
+When scannerserver advertises itself through Bonjour, omit `--server`:
+
+```sh
+swift run -c release scannerserver-worker \
+  --name "Mac Studio" \
+  --cpus 11 \
+  --container-image gitmaster.jinx.eu/jnxpublic/scannerserver:jinx
+```
+
+Set `SCAN_OCR_WORKER_BONJOUR_ENABLED=true` on scannerserver to start the optional
+`avahi-publish-service` publisher. Its Avahi daemon must already be reachable. Set
+`SCANNERSERVER_BONJOUR_URL` to the URL that Macs can use, particularly when scannerserver's
+container hostname is not resolvable on the LAN:
+
+```yaml
+environment:
+  SCAN_OCR_WORKER_BONJOUR_ENABLED: "true"
+  SCANNERSERVER_BONJOUR_URL: "http://scanner-host.local"
+```
+
+Bonjour publication is best-effort and does not affect the scanner service if Avahi is missing or
+unavailable. Passing `--server` to the worker bypasses discovery completely.
+
+The native command defaults to the active processor count minus one so macOS retains one processor
+for interactive work.
+
+Useful worker overrides:
+
+```text
+--container-runtime container
+--container-image gitmaster.jinx.eu/jnxpublic/scannerserver:jinx
+--memory-per-job 8G
+--max-concurrent-jobs 4
+--workspace ~/Library/Caches/scannerserver-worker/jobs
+--direct-ocr
+```
+
+`--max-concurrent-jobs` is an optional safety cap for memory- or thermally constrained machines.
+When omitted, it defaults to the detected CPU count. The former `--jobs` spelling remains accepted
+as a hidden compatibility alias but is deprecated. Whole-document jobs are still valid, but use one
+CPU per document; the optimized ScanSnap Wi-Fi path dispatches one-page jobs.
+
+Stop a foreground native worker with Control-C. Its identity remains in
+`~/.config/scannerserver-worker/identity.json`, so it does not need approval again.
+
+The API accepts HTTP because the main service has no TLS termination contract. Worker and lease
+tokens authenticate every document operation, but document bytes are not encrypted over plain HTTP.
+Run this only on a trusted LAN or put scannerserver behind HTTPS before using an untrusted network.
+
+## Protocol
+
+The current protocol version is `1`:
+
+```text
+POST /api/ocr-workers/register
+POST /api/ocr-workers/{worker-id}/heartbeat
+POST /api/ocr-workers/{worker-id}/jobs/lease
+GET  /api/ocr-workers/{worker-id}/jobs/{job-id}/source
+POST /api/ocr-workers/{worker-id}/jobs/{job-id}/renew
+POST /api/ocr-workers/{worker-id}/jobs/{job-id}/result
+POST /api/ocr-workers/{worker-id}/jobs/{job-id}/fail
+GET  /api/ocr-workers
+```
+
+The browser approval, pause/resume, enable/disable, and delete controls use server-rendered form
+routes under `/workers/{worker-id}/...`; internal fallback pause/resume and settings use
+`/internal-worker/...`.
+The public listing contains worker metadata and status but never authentication tokens.
+
+Remote manifests may carry optional document, batch, page, and operation metadata. Older persisted
+jobs without these fields remain decodable. ScanSnap Wi-Fi page sharding preserves source order and
+publishes the assembled `.ocr.pdf` only when every page has completed successfully. On failure with
+`SCAN_OCR_ONLY`, the private raw PDF is published as a fallback before the scan workspace is
+removed; if that fallback cannot be published, the workspace is kept and the error is reported.
+Cancellation removes the workspace without publishing it. Without `SCAN_OCR_ONLY`, the raw PDF is
+already published independently and is never replaced.

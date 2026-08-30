@@ -3,17 +3,30 @@
 FROM swift:6.3.2-noble AS swift_build
 
 WORKDIR /swift
+ARG TARGETARCH
 COPY Package.swift Package.resolved ./
-RUN swift package resolve
+RUN --mount=type=cache,id=scannerserver-swift-build-${TARGETARCH},target=/swift/.build,sharing=locked \
+    --mount=type=cache,id=scannerserver-swiftpm-${TARGETARCH},target=/root/.cache,sharing=locked \
+    --mount=type=cache,id=scannerserver-swiftpm-config-${TARGETARCH},target=/root/.swiftpm,sharing=locked \
+    swift package resolve
 
 COPY Sources Sources
 COPY tests/ScannerServerCoreTests tests/ScannerServerCoreTests
-RUN swift build -c release --jobs 1 --product scannerserver \
+RUN --mount=type=cache,id=scannerserver-swift-build-${TARGETARCH},target=/swift/.build,sharing=locked \
+    --mount=type=cache,id=scannerserver-swiftpm-${TARGETARCH},target=/root/.cache,sharing=locked \
+    --mount=type=cache,id=scannerserver-swiftpm-config-${TARGETARCH},target=/root/.swiftpm,sharing=locked \
+    swift build -c release --jobs 1 --product scannerserver \
+        -Xswiftc -num-threads -Xswiftc 1 \
+    && swift build -c release --jobs 1 --product scannerserver-worker \
         -Xswiftc -num-threads -Xswiftc 1 \
     && binary_path="$(find /swift/.build -path '*/release/scannerserver' -type f | head -n 1)" \
+    && worker_binary_path="$(find /swift/.build -path '*/release/scannerserver-worker' -type f | head -n 1)" \
     && test -n "${binary_path}" \
-    && install -Dm755 "${binary_path}" /out/scannerserver
-RUN resource_path="$(find /swift/.build -type d -name '*_ScannerServerCore.resources' | head -n 1)" \
+    && test -n "${worker_binary_path}" \
+    && install -Dm755 "${binary_path}" /out/scannerserver \
+    && install -Dm755 "${worker_binary_path}" /out/scannerserver-worker
+RUN --mount=type=cache,id=scannerserver-swift-build-${TARGETARCH},target=/swift/.build,sharing=locked \
+    resource_path="$(find /swift/.build -type d -name '*_ScannerServerCore.resources' | head -n 1)" \
     && test -n "${resource_path}" \
     && cp -R "${resource_path}" /out/ScannerServer_ScannerServerCore.resources
 
@@ -23,6 +36,7 @@ ARG APP_UID=1000
 ARG APP_GID=1000
 ARG VCS_REF=unknown
 ARG SCANNERSERVER_VERSION=development
+ARG OCRMYPDF_VERSION=17.8.1
 
 LABEL org.opencontainers.image.title="scannerserver" \
     org.opencontainers.image.version="${SCANNERSERVER_VERSION}" \
@@ -33,7 +47,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     SANE_CONFIG_DIR=/app/sane.d \
     TZ=Europe/Berlin \
     SCANNERSERVER_VERSION=${SCANNERSERVER_VERSION} \
-    SCANNERSERVER_REVISION=${VCS_REF}
+    SCANNERSERVER_REVISION=${VCS_REF} \
+    OCRMYPDF_VERSION=${OCRMYPDF_VERSION}
 
 RUN sed -i \
         -e 's/ noble-backports//g' \
@@ -46,6 +61,7 @@ RUN sed -i \
         avahi-daemon \
         avahi-utils \
         dbus \
+        fonts-noto-core \
         img2pdf \
         iproute2 \
         libcap2-bin \
@@ -53,6 +69,7 @@ RUN sed -i \
         libvips-tools \
         ocrmypdf \
         poppler-utils \
+        python3-venv \
         qpdf \
         sane-airscan \
         sane-utils \
@@ -62,20 +79,34 @@ RUN sed -i \
         tzdata \
     && rm -rf /var/lib/apt/lists/*
 
+RUN python3 -m venv /opt/ocrmypdf \
+    && /opt/ocrmypdf/bin/python -m pip install \
+        --disable-pip-version-check \
+        --no-cache-dir \
+        --retries 5 \
+        "ocrmypdf==${OCRMYPDF_VERSION}" \
+    && test "$(/opt/ocrmypdf/bin/ocrmypdf --version 2>&1)" = "${OCRMYPDF_VERSION}" \
+    && install -d /usr/local/bin \
+    && ln -sf /opt/ocrmypdf/bin/ocrmypdf /usr/local/bin/ocrmypdf
+
 WORKDIR /app
 
-RUN mkdir -p /app/sane.d /opt/scannerserver /scans /home/scansnap \
+RUN mkdir -p /app/sane.d /opt/scannerserver /scans \
+        /home/scansnap/.config/scannerserver-worker \
+        /home/scansnap/.cache/scannerserver-worker/jobs \
     && cp -a /etc/sane.d/. /app/sane.d/ \
     && chown -R "${APP_UID}:${APP_GID}" /app /scans /home/scansnap
 
 COPY --from=swift_build /out/scannerserver /opt/scannerserver/scannerserver
+COPY --from=swift_build /out/scannerserver-worker /opt/scannerserver/scannerserver-worker
 COPY --from=swift_build /out/ScannerServer_ScannerServerCore.resources /opt/scannerserver/ScannerServer_ScannerServerCore.resources
 COPY scripts/entrypoint.sh /usr/local/bin/scansnap-entrypoint
 
 RUN chmod +x /usr/local/bin/scansnap-entrypoint \
     && setcap cap_net_bind_service=+ep /opt/scannerserver/scannerserver
 
-ENV PATH="${PATH}:/opt/scannerserver"
+ENV PATH="/opt/ocrmypdf/bin:${PATH}:/opt/scannerserver"
+ENV SCANNERSERVER_WORKER_DIRECT=true
 
 EXPOSE 8080
 EXPOSE 80

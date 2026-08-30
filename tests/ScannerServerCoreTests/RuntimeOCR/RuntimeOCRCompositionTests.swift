@@ -45,7 +45,7 @@ struct RuntimeOCRCompositionTests {
             )),
         ])
         let ocrQueue = OCRQueueActor(
-            executor: executor,
+            ocrExecutor: ProcessBackedOCRExecutor(executor),
             configuration: OCRQueueConfiguration(cpuLimit: 3, niceLevel: 10)
         )
         let dependencies = fixture.dependencies(ocrQueue: ocrQueue)
@@ -62,9 +62,10 @@ struct RuntimeOCRCompositionTests {
             try await client.execute(uri: "/", method: .get) { response in
                 let body = String(buffer: response.body)
                 #expect(response.status == .ok)
-                #expect(body.contains("<h2>Background processing</h2>"))
-                #expect(body.contains("<span class=\"status\">running</span> 1 queued"))
-                #expect(body.contains("CPU budget: 3; priority: nice +10"))
+                #expect(body.contains("<h3>Background processing</h3>"))
+                #expect(body.contains("<span class=\"status-pill working\">Running</span>"))
+                #expect(body.contains("1 queued"))
+                #expect(body.contains("CPU budget 3 · priority nice +10"))
                 #expect(body.contains("Input: /scans/&lt;first&gt;&amp;.pdf"))
                 #expect(!body.contains(firstInput))
             }
@@ -74,7 +75,7 @@ struct RuntimeOCRCompositionTests {
 
             try await client.execute(uri: "/", method: .get) { response in
                 let body = String(buffer: response.body)
-                #expect(body.contains("<span class=\"status\">failed (9)</span>"))
+                #expect(body.contains("<span class=\"status-pill error\">Failed (9)</span>"))
                 #expect(body.contains("Input: /scans/&lt;second&gt;&amp;.pdf"))
                 #expect(body.contains("<pre>&lt;ocr-output&gt;&amp;</pre>"))
                 #expect(body.contains("<pre>&lt;ocr-error&gt;&amp;</pre>"))
@@ -93,7 +94,7 @@ struct RuntimeOCRCompositionTests {
             .suspended(ProcessResult(exitStatus: 0)),
             .suspended(ProcessResult(exitStatus: 0)),
         ])
-        let ocrQueue = OCRQueueActor(executor: executor)
+        let ocrQueue = OCRQueueActor(ocrExecutor: ProcessBackedOCRExecutor(executor))
         let scanJobs = ScanJobActor(
             nativeScanner: ProcessBackedTestScanner(executor),
             ocrQueue: ocrQueue
@@ -157,6 +158,7 @@ private struct LiveCommandFixture {
         environment["SCAN_OCR_ENABLED"] = "true"
         environment["SCAN_REMOVE_BLANK_PAGES"] = "false"
         environment["SCAN_CROP_PAGES"] = "false"
+        environment["SCAN_OCR_ONLY"] = "false"
         environment["SCAN_OUTPUT_DIR"] = scans.path
         environment["SCAN_SETTINGS_PATH"] = scans.appendingPathComponent(".scanner-settings.json").path
         environment["SCANNER_CONFIG_PATH"] = scans.appendingPathComponent(".scannerserver-scanner.json").path

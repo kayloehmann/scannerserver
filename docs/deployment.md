@@ -39,6 +39,10 @@ For example:
 docker pull gitmaster.jinx.eu/jnxpublic/scannerserver:development
 ```
 
+The image packages both executable products. Its default command runs `scannerserver`; overriding
+the command with `scannerserver-worker` starts a direct, non-privileged OCR worker from the same
+image without mounting the Docker socket.
+
 Gitmaster executes workflow steps inside a Linux job container while Docker Desktop runs the
 Docker daemon on the Mac host. Paths such as `/workspace/...` therefore exist only inside the
 job container and cannot be used as host bind mounts. The workflow copies Swift sources through
@@ -141,49 +145,76 @@ docker compose up -d
 
 `git_commit_version.sh` formats the commit timestamp recorded by Git as `YYYY.MM.DD.HHMMSS`.
 The image exposes that value in the web page header, at `/version`, through
-`SCANNERSERVER_VERSION`, and in the OCI image version label. The full commit SHA remains available
+`SCANNERSERVER_VERSION`, and in the OCI image version label. The header version links to the
+project's [GitHub releases](https://github.com/jollyjinx/scannerserver/releases), while `/version`
+remains a plain-text endpoint for scripts and health tooling. The full commit SHA remains available
 as `SCANNERSERVER_REVISION` and in the OCI revision label. Automated GitHub, Gitmaster, and
-`build_push_development.sh` builds set both values.
+`build_and_push_image.sh` builds set both values.
 
-## Build And Push Development
+## Build And Push An Image
 
-Build and push a development image for both AMD64 and ARM64:
+Select exactly one registry. With no architecture option, the script builds and pushes both AMD64
+and ARM64 under one multi-platform tag:
 
 ```bash
-./scripts/build_push_development.sh
+./scripts/build_and_push_image.sh --github
+./scripts/build_and_push_image.sh --gitmaster
 ```
 
-By default it builds and pushes:
+The default tag is the current branch name, normalized with the same rules as the Gitmaster
+workflow. For example, running from `development` publishes one of:
 
 ```text
 ghcr.io/jollyjinx/scannerserver:development
+gitmaster.jinx.eu/jnxpublic/scannerserver:development
 ```
 
-The script uses Docker Buildx for the multi-platform registry-publishing workflow:
+Use `--tag` to override it:
 
 ```bash
-docker buildx build --platform linux/amd64,linux/arm64 --push ...
+./scripts/build_and_push_image.sh --github --tag jinx
 ```
 
-Pass a different tag as the first argument. Override the image repository with `IMAGE` if needed:
+For a faster native-architecture build, select only one platform:
 
 ```bash
-./scripts/build_push_development.sh test
-IMAGE=ghcr.io/your-user/scannerserver ./scripts/build_push_development.sh test
+./scripts/build_and_push_image.sh --gitmaster --arm64 --tag jinx
+./scripts/build_and_push_image.sh --github --amd64 --tag test-amd64
 ```
 
-`TAG` remains supported as an environment fallback when no positional tag is provided. The positional argument takes precedence.
+Single-platform publication replaces the selected registry tag with a single-platform manifest. Use
+an architecture-specific tag when existing consumers of the same tag still need the other
+architecture.
 
-The previous `build_push_development_arm64.sh` path remains as a compatibility wrapper and now also publishes both architectures.
+On macOS, the script uses Apple Container to build locally and then push the resulting image. On
+other hosts it uses Docker Buildx and pushes directly from the builder. Registry login remains an
+operator prerequisite: use `container registry login` on macOS or `docker login` elsewhere.
 
-The script requires at least 10 GiB of free host disk space before starting because a dual-architecture Buildx build can expand Docker Desktop's VM disk substantially. `MIN_FREE_GIB` can raise that threshold. Setting `MIN_FREE_GIB=0` bypasses the check deliberately.
+The Swift build stage keeps per-architecture BuildKit cache mounts for `/swift/.build`, SwiftPM
+downloads, and SwiftPM configuration. After the first image build, unchanged dependencies and
+Swift source files reuse their Linux release artifacts; only invalidated sources are recompiled.
+The host package's `.build` directory is intentionally not mounted because macOS objects cannot be
+used in a Linux image and ARM64/AMD64 build products must remain isolated.
 
-If the container runtime reports `Structure needs cleaning`, prune the builder cache and rerun:
+The runtime stage retains Ubuntu Noble's OCRmyPDF package for native dependencies and installs the
+application's pinned OCRmyPDF `17.8.1` into `/opt/ocrmypdf`. The isolated executable takes
+precedence on `PATH`; `OCRMYPDF_VERSION` exposes the selected build version, and the container smoke
+test verifies it. A development build can temporarily test another release with
+`--build-arg OCRMYPDF_VERSION=<version>`, but the checked-in pin remains the supported version.
+
+Run `--help` for the complete interface:
 
 ```bash
-docker buildx prune --all --force
-docker builder prune --all --force
-./scripts/build_push_development.sh development
+./scripts/build_and_push_image.sh --help
 ```
 
-If the output instead contains `input/output error`, `read-only file system`, `metadata_v2.db`, or `UNEXPECTED INCONSISTENCY`, Docker's VM filesystem is unhealthy. Free host disk space first, restart Docker Desktop, and follow Docker Desktop's backup and recovery workflow. A Docker Desktop Clean / Purge operation deletes local containers, images, and volumes and should only be used after preserving any required data.
+Publishing a numbered project release also requires validation, an annotated Git tag, a GitHub
+Release, and verification of the multi-platform GHCR manifest. Follow the
+[maintainer release checklist](releasing.md) instead of using this development-image script as the
+release procedure.
+
+If Docker reports `Structure needs cleaning`, `input/output error`, `read-only file system`,
+`metadata_v2.db`, or `UNEXPECTED INCONSISTENCY`, its VM filesystem is unhealthy. Free host disk
+space first, restart Docker Desktop, and follow Docker Desktop's backup and recovery workflow. A
+Docker Desktop Clean / Purge operation deletes local containers, images, and volumes and should
+only be used after preserving required data.

@@ -17,19 +17,49 @@ YYYY-MM-DD.HHMMSS.pdf
 YYYY-MM-DD.HHMMSS.ocr.pdf
 ```
 
+By default both files are published. With `SCAN_OCR_ONLY=true`, only the searchable OCR PDF is
+published. The source PDF stays in the private scan workspace and is removed once OCR succeeds, so
+the scan directory holds one file per scan instead of a raw/searchable pair. If OCR or document
+processing fails, the source PDF is published as a fallback so no scan is lost; cancellation
+publishes nothing. If the fallback publication itself fails, the source PDF remains in the private
+scan workspace and the error is reported. PNG exports and PDFs imported on the Documents page are
+unaffected.
+
 The date and time prefix uses the service's `TZ` setting, including daylight-saving changes. The
 web status timestamps and file-list day headings use the same time zone.
 
-For multipage PDF mode, the acquisition lifecycle finishes as soon as the source PDF is published.
-For single-page PDF and PNG modes, it finishes after the captured raw document is handed to the
+For multipage PDF mode, the acquisition lifecycle finishes as soon as the source PDF is published
+or, with `SCAN_OCR_ONLY`, once the assembled OCR PDF is placed. For single-page PDF and PNG modes,
+it finishes after the captured raw document is handed to the
 background queue; blank removal and crop still run across the complete document before the queue
 publishes individual files. The web scan control and physical button can therefore accept another
 scan while blank-page removal, crop, final-output conversion, or OCR is still running. Without OCR,
 the background queue processes an isolated multipage copy and atomically replaces the source PDF.
-With OCR, it leaves the source unchanged and publishes the processed `.ocr.pdf`.
+With OCR and `SCAN_OCR_ONLY`, it publishes only the processed `.ocr.pdf` and removes the private raw
+copy after success; if the raw fallback cannot be published on failure, the copy stays in the
+private workspace and the error is reported.
 
-Deleting a source scan while processing is active cancels that document's work before removing the
-file. Matching queued work is removed as well, while jobs for other scans continue.
+For OCR-enabled multipage ScanSnap Wi-Fi scans, each page is OCRed, autocropped, and blank-filtered
+before ordered assembly. A capable remote worker performs those CPU-heavy operations; local
+fallback preserves the same settings. Scannerserver performs only ordered assembly, the all-blank
+keep-one safeguard, metadata, and atomic publication. One actor owns that document lifecycle and
+commits the final file only after its staging task returns for the still-current document generation;
+cancellation invalidates the generation first, so late page results cannot publish. Other backends
+and output modes retain their established whole-document processing order.
+
+PDFs imported on the Documents page use the same page-oriented path: scannerserver preserves the
+uploaded source, splits a private working copy into one-page jobs, fills the aggregate capacity of
+all compatible remote workers, and assembles the resulting `.ocr.pdf` in source order. Each split
+page is yielded to the OCR scheduler immediately instead of waiting for the entire upload to be
+split. Imported documents share ordering, all-blank, metadata, atomic-publication, cancellation, and
+workspace-cleanup semantics with Wi-Fi streaming scans; their explicit failure policy preserves the
+uploaded source instead of using the Wi-Fi-only raw fallback.
+
+The Documents page reads and removes visible PDF/PNG outputs through one serialized collection
+lifecycle. Deleting a source scan while processing is active cancels that document's work before
+removing the file and its cached preview. Matching queued work is removed as well, while jobs for
+other scans continue. Scan and OCR publication remains atomic, and a newly published output appears
+in the next Documents-page snapshot.
 
 Single-page PDF modes use:
 
@@ -39,8 +69,11 @@ YYYY-MM-DD.HHMMSS-page-0001.ocr.pdf
 ```
 
 These individual files appear after background blank removal, crop, metadata, and splitting finish.
-OCR variants then appear beside them as their queued jobs complete. PNG exports follow the same
-deferred final-output lifecycle.
+OCR variants then appear beside them as their queued jobs complete. With `SCAN_OCR_ONLY`, only the
+`.ocr.pdf` pages are published; the raw pages stay in the private scan workspace and are removed as
+their OCR succeeds, with a raw-page fallback published for any page whose OCR fails. A page whose
+raw fallback cannot be published stays in the private scan workspace and the error is reported. PNG
+exports follow the same deferred final-output lifecycle.
 
 PNG modes save one image per page:
 
@@ -59,9 +92,24 @@ On first start, the web UI creates `/scans/.scanner-settings.json` with default 
 - `Duplex PDF`
 - `Single Page PDFs + OCR`
 
-Use **Advanced settings** in the web UI to add, edit, delete, or choose the mode used by the physical scanner button.
+Use **Scan Settings** in the web UI to add, edit, delete, or choose the mode used by the physical scanner button and to configure blank-page detection thresholds shared by every preset. The **Scanner** page only selects a preset and starts a scan. **Network Setup** contains scanner connection management.
 
-With the ScanSnap Wi-Fi backend, modes control simplex/duplex, output conversion, OCR, the background CPU limit and post-scan process priority, blank-page removal, autocrop, and the extra margin kept around cropped content. The OCR card offers a **Processing CPUs** dropdown: **Automatic** uses the container-aware background allowance, while a number lowers the limit for that mode. **Post-scan priority** selects normal or reduced (`nice`) priority for every external tool launched by background processing. The reverse-engineered Wi-Fi scanner command does not expose resolution or color controls. `SCAN_RESOLUTION`, `SCAN_MODE`, and `SCAN_SOURCE` are mainly for the SANE fallback backend. The web UI shows a short explanation beneath every mode setting.
+With the ScanSnap Wi-Fi backend, modes control simplex/duplex, output conversion, OCR language,
+blank-page removal, autocrop, and the extra margin kept around cropped content. Processing CPU
+capacity and post-scan process priority belong to the built-in worker and are configured once on the
+**Workers** page rather than repeated in every preset. The reverse-engineered Wi-Fi scanner command
+does not expose resolution or color controls. `SCAN_RESOLUTION`, `SCAN_MODE`, and `SCAN_SOURCE` are
+mainly for the SANE fallback backend. The web UI shows a short explanation beneath every mode
+setting.
+
+Older `.scanner-settings.json` files that contain `SCAN_OCR_CPU_LIMIT` or `SCAN_OCR_NICE` inside a
+preset remain readable. Those legacy per-preset values are ignored when a scan starts; saving a
+preset through the current UI uses the built-in worker policy instead.
+
+OCR dispatch is internally typed but does not change the configuration contract. The configured
+language, crop settings, blank-page thresholds, remote timeouts, and worker
+metadata are translated into the existing protocol-v1 worker manifest fields. Remote assignment or
+execution failure retains local fallback; task cancellation does not fall back.
 
 ## Common Environment Variables
 
@@ -70,18 +118,36 @@ With the ScanSnap Wi-Fi backend, modes control simplex/duplex, output conversion
 | `TZ` | `Europe/Berlin` | Local IANA time zone used for scan filenames, file grouping, and status timestamps |
 | `SCAN_OUTPUT_DIR` | `/scans` | Output directory inside the container |
 | `TMPDIR` | `<SCAN_OUTPUT_DIR>/.ocr-tmp` | Writable temporary directory created at startup and used by OCRmyPDF, Ghostscript, Tesseract, and other document tools |
-| `SCAN_SETTINGS_PATH` | `/scans/.scanner-settings.json` | Saved scan modes and button-default mode |
+| `SCAN_SETTINGS_PATH` | `/scans/.scanner-settings.json` | Saved scan modes, button-default mode, and shared blank-page thresholds |
 | `SCANNER_CONFIG_PATH` | `/scans/.scannerserver-scanner.json` | Saved Wi-Fi scanner IP and derived pairing identity |
 | `SCAN_BACKEND` | `wifi` | `wifi` for iX500 Wi-Fi protocol, `sane` for SANE fallback |
 | `SCAN_LANGUAGE` | `deu+eng` | OCR languages passed to OCRmyPDF/Tesseract |
 | `SCAN_FORMAT` | `pdf` | `pdf` or `png` |
 | `SCAN_PAGE_MODE` | `multi` | `multi` for one multipage PDF, `single` for one PDF per page |
 | `SCAN_OCR_ENABLED` | `true` | Queue OCR for PDF output after scanning |
-| `SCAN_OCR_CPU_LIMIT` | detected CPUs minus one | Optional positive cap on CPUs used by background page processing and OCR; values above the background allowance are clamped |
-| `SCAN_OCR_NICE` | `false` | Run post-scan document-processing subprocesses with reduced CPU scheduling priority |
-| `SCAN_OCR_NICE_LEVEL` | `10` | Nice increment from `1` through `19` when `SCAN_OCR_NICE` is enabled |
+| `SCAN_OCR_ONLY` | `false` | Publish only the OCR result for PDF scans. The raw PDF stays in the private scan workspace and is deleted after OCR succeeds; on OCR/processing failure it is published as a fallback, while cancellation publishes nothing. If the fallback publication fails, the raw PDF remains in the private scan workspace and the error is reported. PNG output and imported PDFs are unaffected |
+| `SCAN_OCR_CPU_LIMIT` | detected CPUs minus one | Startup cap/default for the built-in worker's processing CPUs; the persisted Workers-page setting may lower it |
+| `SCAN_OCR_NICE` | `false` | Selects initial **Niced** rather than **Normal** priority when no persisted worker preference exists |
+| `SCAN_OCR_NICE_LEVEL` | `10` | Nice increment from `1` through `19` when the built-in worker uses reduced priority |
+| `SCAN_OCR_WORKERS_PATH` | `<SCAN_OUTPUT_DIR>/.scannerserver-ocr-workers.json` | Registered OCR worker identities, approvals, and last-known state |
+| `SCAN_OCR_WORKER_JOBS_PATH` | `<SCAN_OUTPUT_DIR>/.scannerserver-ocr-jobs.json` | Durable remote OCR job manifests, lease state, and terminal results |
+| `SCAN_INTERNAL_OCR_WORKER_PATH` | `<SCAN_OUTPUT_DIR>/.scannerserver-internal-ocr-worker.json` | Persisted pause, CPU-limit, and priority state for scannerserver's internal OCR fallback worker |
+| `SCAN_OCR_REMOTE_ENABLED` | `true` | Dispatch OCRmyPDF work to approved compatible workers when available; local OCR remains the fallback |
+| `SCAN_OCR_REMOTE_ASSIGNMENT_WAIT_SECONDS` | `30` | Time an eligible remote job may remain unclaimed (including after lease expiry) before local fallback |
+| `SCAN_OCR_REMOTE_COMPLETION_TIMEOUT_SECONDS` | `3600` | Maximum total remote job duration before cancellation and local fallback |
+| `SCAN_OCR_WORKER_MAX_RESULT_BYTES` | `1073741824` | Maximum PDF upload size accepted from an authenticated worker |
+| `SCAN_PDF_UPLOAD_MAX_BYTES` | `1073741824` | Maximum size of a PDF uploaded through the Documents page or OCR API |
+| `SCAN_OCR_API_TOKEN` | empty | Optional bearer token required by OCR API operations; leave empty only on a trusted network |
+| `SCAN_OCR_WORKER_BONJOUR_ENABLED` | `false` | Publish `_scannerserver._tcp` for OCR worker discovery through `avahi-publish-service` |
+| `SCANNERSERVER_BONJOUR_NAME` | `scannerserver` | Bonjour service instance name |
+| `SCANNERSERVER_BONJOUR_HOST` | process hostname | Host used to derive the advertised URL when no complete URL is configured |
+| `SCANNERSERVER_BONJOUR_URL` | derived HTTP URL | Complete LAN-reachable HTTP(S) URL placed in the Bonjour TXT record |
 | `SCAN_CROP_PAGES` | `true` | Crop PDF pages to the detected paper or content bounds in background processing |
 | `SCAN_CROP_MARGIN_POINTS` | `1` | Extra margin around content-classified autocrops, in PDF points (1 point = 1/72 inch) |
+| `SCAN_REMOVE_BLANK_PAGES` | `true` | Per-preset switch for discarding pages detected as blank |
+| `SCAN_BLANK_WHITE_THRESHOLD` | `230` | Initial shared grayscale value at or above which a pixel counts as white (0–255) |
+| `SCAN_BLANK_CONTENT_RATIO_THRESHOLD` | `0.003` | Initial shared maximum fraction of non-white pixels allowed on a blank page (0–1) |
+| `SCAN_BLANK_MEAN_THRESHOLD` | `248` | Initial shared minimum average grayscale brightness for a blank page (0–255) |
 | `SCANNER_IP` | empty | Optional scanner IP override; web setup can persist this instead |
 | `SCANSNAP_PAIRING_KEY` | empty | Optional pairing identity override; web setup can derive and persist this instead |
 | `SCANSNAP_CLIENT_IP` | empty | Optional client IP override for macvlan/static-IP deployments |
@@ -116,14 +182,19 @@ Background page processing and OCR automatically use the CPU allowance visible t
 process's active processor count plus Linux cgroup CPU quota and cpuset restrictions, so Docker
 CPU limits are honored. One detected processor is reserved for acquisition, button handling, and
 HTTP work (a one-CPU container still gets one worker). `SCAN_OCR_CPU_LIMIT` can lower the remaining
-allowance but cannot raise it. It can be configured globally in the container environment or per
-scan mode with the web UI. A mode set to **Automatic** inherits this container-aware allowance.
+allowance but cannot raise it. On the **Workers** page, the internal worker's **Processing CPUs**
+setting can lower that allowance further; **Automatic** uses the complete container-aware allowance.
+The choice is worker-wide and persists independently of scan presets.
 
 The queue treats the resulting value as one shared CPU budget:
 
 - Multipage blank detection and crop analysis process several pages concurrently, bounded by the
   shared budget; operations within each page remain ordered.
-
+- Streaming ScanSnap pages can move OCR, autocrop, and blank-page filtering to capability-compatible
+  remote workers. Local fallback consumes the scanner host's shared budget with the same per-page
+  order and settings.
+- PDFs imported on the Documents page are split into page jobs and use the same distributed worker
+  capacity and ordered finalization as a streaming scan.
 - A multipage PDF reserves the full budget and passes it to OCRmyPDF with `--jobs` so its pages
   are processed in parallel.
 - Single-page PDF mode starts one OCRmyPDF process per page, up to the budget, and gives each
@@ -131,13 +202,27 @@ The queue treats the resulting value as one shared CPU budget:
 - Multipage and single-page work do not oversubscribe each other. FIFO ordering is preserved when
   the next document needs more CPU slots than are currently free.
 
-Post-scan processing runs at normal process priority by default so a busy service host cannot starve
-background work. Reduced-priority mode remains available as an explicit opt-in, globally through
-the environment or per scan mode through **Post-scan priority** in the web UI. When enabled, the
-nice level applies to every external tool launched after scanner acquisition releases its foreground
-lifecycle, including blank removal, autocrop, final output conversion, metadata updates, and OCR.
+Remote workers use a page-oriented capacity model: their detected CPU count becomes the default
+number of concurrent leases, and every job runs with one CPU and OCRmyPDF `--jobs 1`. The optional
+worker CLI `--max-concurrent-jobs` lowers concurrency for memory- or thermally constrained hosts.
+Whole-document remote jobs remain supported but use one CPU per document; streaming ScanSnap scans
+and imported PDFs avoid that limitation by scheduling individual pages.
+
+Post-scan processing runs at normal process priority by default. The built-in worker's
+**Post-scan priority** setting on the **Workers** page has three immediately applied choices:
+
+- **Normal** adds local capacity alongside remote workers and runs local subprocesses normally.
+- **Niced** adds the same local capacity but lowers the OS priority of local subprocesses.
+- **Fallback only** does not reserve local slots while compatible remote capacity is available; if
+  remote capacity is unavailable or remote execution fails, it runs the local fallback niced.
+
+`SCAN_OCR_NICE` chooses **Niced** rather than **Normal** initially when no worker preference has
+been persisted. In both niced modes, the nice level applies to every external tool launched after
+scanner acquisition releases its foreground lifecycle, including blank removal, autocrop, final
+output conversion, metadata updates, and OCR.
 The scannerserver process and scanner acquisition remain at normal priority. The global nice level
-controls the increment used by niced modes. To use at most four CPUs and a nice level of `+15`:
+controls the increment used by the niced internal worker. To make four CPUs the maximum/default and
+use a nice level of `+15` initially:
 
 ```yaml
 environment:
@@ -167,7 +252,14 @@ and `/health` remains available while the scan directory is inaccessible.
 Blank-page removal is enabled by default for PDF scans. Analysis ignores the outer three percent
 of the embedded page image so the scanner border and edge shadows are not mistaken for content.
 
-Useful settings:
+Use **Scan Settings → Blank-page detection** to tune the white, content-ratio, and mean-brightness
+thresholds. These values are stored once in `.scanner-settings.json` and are shared by web scans,
+PDF imports, physical-button scans, and every preset. The **Remove blanks** switch remains separate
+for each preset, so a preset can opt out without changing the shared detector calibration.
+
+The threshold environment variables below seed the shared values when the settings file or its
+`blank_page_settings` object does not yet exist. `SCAN_REMOVE_BLANK_PAGES` similarly seeds the
+per-preset switch. Once saved on the website, the persisted values take precedence:
 
 ```yaml
 environment:

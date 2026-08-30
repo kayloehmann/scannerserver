@@ -1,0 +1,285 @@
+import Foundation
+
+public enum OCRWorkerJobStatus: String, Codable, Equatable, Sendable {
+    case queued
+    case leased
+    case succeeded
+    case failed
+    case cancelled
+}
+
+public struct OCRWorkerJobMetadata: Codable, Equatable, Sendable {
+    public let documentName: String
+    public let batchID: String?
+    public let pageNumber: Int?
+    public let operations: [String]
+
+    public init(
+        documentName: String,
+        batchID: String? = nil,
+        pageNumber: Int? = nil,
+        operations: [String] = []
+    ) {
+        self.documentName = documentName
+        self.batchID = batchID
+        self.pageNumber = pageNumber
+        self.operations = operations
+    }
+}
+
+public struct OCRWorkerCropConfiguration: Codable, Equatable, Sendable {
+    public let backgroundDelta: Int
+    public let borderPixels: Int
+    public let marginPoints: Double
+    public let maximumWidthRatio: Double
+    public let maximumHeightRatio: Double
+    public let minimumDensity: Double
+    public let keepOriginalBoxes: Bool
+    public let debug: Bool
+
+    public init(
+        backgroundDelta: Int = 8,
+        borderPixels: Int = 64,
+        marginPoints: Double = 1.0,
+        maximumWidthRatio: Double = 0.80,
+        maximumHeightRatio: Double = 0.80,
+        minimumDensity: Double = 0.08,
+        keepOriginalBoxes: Bool = false,
+        debug: Bool = false
+    ) {
+        self.backgroundDelta = backgroundDelta
+        self.borderPixels = borderPixels
+        self.marginPoints = marginPoints
+        self.maximumWidthRatio = maximumWidthRatio
+        self.maximumHeightRatio = maximumHeightRatio
+        self.minimumDensity = minimumDensity
+        self.keepOriginalBoxes = keepOriginalBoxes
+        self.debug = debug
+    }
+
+    public init(request: CropPDFPagesRequest) {
+        self.init(
+            backgroundDelta: request.backgroundDelta,
+            borderPixels: request.borderPixels,
+            marginPoints: request.marginPoints,
+            maximumWidthRatio: request.maximumWidthRatio,
+            maximumHeightRatio: request.maximumHeightRatio,
+            minimumDensity: request.minimumDensity,
+            keepOriginalBoxes: request.keepOriginalBoxes,
+            debug: request.debug
+        )
+    }
+
+    public func request(pdfPath: String) -> CropPDFPagesRequest {
+        CropPDFPagesRequest(
+            pdfPath: pdfPath,
+            backgroundDelta: backgroundDelta,
+            borderPixels: borderPixels,
+            marginPoints: marginPoints,
+            maximumWidthRatio: maximumWidthRatio,
+            maximumHeightRatio: maximumHeightRatio,
+            minimumDensity: minimumDensity,
+            keepOriginalBoxes: keepOriginalBoxes,
+            debug: debug
+        )
+    }
+}
+
+public struct OCRWorkerBlankPageConfiguration: Codable, Equatable, Sendable {
+    public let whiteThreshold: Int
+    public let contentRatioThreshold: Double
+    public let meanThreshold: Double
+    public let debug: Bool
+
+    public init(
+        whiteThreshold: Int = 230,
+        contentRatioThreshold: Double = 0.003,
+        meanThreshold: Double = 248.0,
+        debug: Bool = false
+    ) {
+        self.whiteThreshold = whiteThreshold
+        self.contentRatioThreshold = contentRatioThreshold
+        self.meanThreshold = meanThreshold
+        self.debug = debug
+    }
+
+    public init(request: RemoveBlankPagesRequest) {
+        self.init(
+            whiteThreshold: request.whiteThreshold,
+            contentRatioThreshold: request.contentRatioThreshold,
+            meanThreshold: request.meanThreshold,
+            debug: request.debug
+        )
+    }
+
+    public func request(pdfPath: String) -> RemoveBlankPagesRequest {
+        RemoveBlankPagesRequest(
+            pdfPath: pdfPath,
+            whiteThreshold: whiteThreshold,
+            contentRatioThreshold: contentRatioThreshold,
+            meanThreshold: meanThreshold,
+            keepOne: false,
+            debug: debug
+        )
+    }
+}
+
+public struct OCRWorkerJobManifest: Codable, Equatable, Sendable {
+    public let jobID: String
+    public let sourcePath: String
+    public let outputPath: String
+    public let sourceByteCount: Int64
+    public let sourceSHA256: String
+    public let ocrLanguages: [String]
+    public let ocrEnabled: Bool
+    public let removeBlankPages: Bool
+    public let blankPageConfiguration: OCRWorkerBlankPageConfiguration?
+    public let cropPages: Bool
+    public let cropConfiguration: OCRWorkerCropConfiguration?
+    public let containerArguments: [String]?
+    public let metadata: OCRWorkerJobMetadata?
+    public let createdAt: Date
+
+    public init(
+        jobID: String = UUID().uuidString.lowercased(),
+        sourcePath: String,
+        outputPath: String,
+        sourceByteCount: Int64,
+        sourceSHA256: String,
+        ocrLanguages: [String],
+        ocrEnabled: Bool,
+        removeBlankPages: Bool,
+        blankPageConfiguration: OCRWorkerBlankPageConfiguration? = nil,
+        cropPages: Bool,
+        cropConfiguration: OCRWorkerCropConfiguration? = nil,
+        containerArguments: [String]? = nil,
+        metadata: OCRWorkerJobMetadata? = nil,
+        createdAt: Date = Date()
+    ) {
+        self.jobID = jobID
+        self.sourcePath = sourcePath
+        self.outputPath = outputPath
+        self.sourceByteCount = sourceByteCount
+        self.sourceSHA256 = sourceSHA256
+        self.ocrLanguages = ocrLanguages
+        self.ocrEnabled = ocrEnabled
+        self.removeBlankPages = removeBlankPages
+        self.blankPageConfiguration = blankPageConfiguration
+        self.cropPages = cropPages
+        self.cropConfiguration = cropConfiguration
+        self.containerArguments = containerArguments
+        self.metadata = metadata
+        self.createdAt = createdAt
+    }
+}
+
+public struct OCRWorkerJobResult: Codable, Equatable, Sendable {
+    public let outputByteCount: Int64
+    public let outputSHA256: String
+
+    public init(outputByteCount: Int64, outputSHA256: String) {
+        self.outputByteCount = outputByteCount
+        self.outputSHA256 = outputSHA256
+    }
+}
+
+public struct OCRWorkerJobLease: Codable, Equatable, Sendable {
+    public let manifest: OCRWorkerJobManifest
+    public let workerID: String
+    public let leaseToken: String
+    public let leasedAt: Date
+    public let expiresAt: Date
+    public let attempt: Int
+
+    public init(
+        manifest: OCRWorkerJobManifest,
+        workerID: String,
+        leaseToken: String,
+        leasedAt: Date,
+        expiresAt: Date,
+        attempt: Int
+    ) {
+        self.manifest = manifest
+        self.workerID = workerID
+        self.leaseToken = leaseToken
+        self.leasedAt = leasedAt
+        self.expiresAt = expiresAt
+        self.attempt = attempt
+    }
+}
+
+public struct OCRWorkerJobPollRequest: Codable, Equatable, Sendable {
+    public let authenticationToken: String
+    public let waitSeconds: Int
+
+    public init(authenticationToken: String, waitSeconds: Int = 20) {
+        self.authenticationToken = authenticationToken
+        self.waitSeconds = waitSeconds
+    }
+}
+
+public struct OCRWorkerJobLeaseRequest: Codable, Equatable, Sendable {
+    public let authenticationToken: String
+    public let leaseToken: String
+
+    public init(authenticationToken: String, leaseToken: String) {
+        self.authenticationToken = authenticationToken
+        self.leaseToken = leaseToken
+    }
+}
+
+public struct OCRWorkerJobFailureRequest: Codable, Equatable, Sendable {
+    public let authenticationToken: String
+    public let leaseToken: String
+    public let failure: String
+
+    public init(authenticationToken: String, leaseToken: String, failure: String) {
+        self.authenticationToken = authenticationToken
+        self.leaseToken = leaseToken
+        self.failure = failure
+    }
+}
+
+public struct OCRWorkerJobSnapshot: Codable, Equatable, Sendable {
+    public let manifest: OCRWorkerJobManifest
+    public let status: OCRWorkerJobStatus
+    public let attemptCount: Int
+    public let leasedWorkerID: String?
+    public let completedWorkerID: String?
+    public let leasedAt: Date?
+    public let leaseExpiresAt: Date?
+    public let result: OCRWorkerJobResult?
+    public let failure: String?
+    public let updatedAt: Date
+
+    public var workerID: String? { leasedWorkerID ?? completedWorkerID }
+}
+
+public enum OCRWorkerJobStoreError: Error, Equatable, LocalizedError, Sendable {
+    case duplicateJob(String)
+    case invalidManifest
+    case invalidResult
+    case unknownJob(String)
+    case invalidLease
+    case leaseExpired
+    case invalidTransition(from: OCRWorkerJobStatus, to: OCRWorkerJobStatus)
+
+    public var errorDescription: String? {
+        switch self {
+        case .duplicateJob(let jobID):
+            "OCR worker job already exists: \(jobID)"
+        case .invalidManifest:
+            "OCR worker job manifest is invalid."
+        case .invalidResult:
+            "OCR worker job result is invalid."
+        case .unknownJob(let jobID):
+            "OCR worker job does not exist: \(jobID)"
+        case .invalidLease:
+            "OCR worker job lease authentication failed."
+        case .leaseExpired:
+            "OCR worker job lease has expired."
+        case .invalidTransition(let from, let to):
+            "OCR worker job cannot transition from \(from.rawValue) to \(to.rawValue)."
+        }
+    }
+}
