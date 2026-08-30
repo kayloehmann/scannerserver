@@ -2053,7 +2053,7 @@ private func renderModes(
     settings: ScanSettings,
     selectedMode: ScanMode
 ) -> String {
-    var html = "<section class=\"preset-workspace\"><div class=\"section-heading\"><div>"
+    var html = "<section class=\"preset-workspace\" data-preset-editor><div class=\"section-heading\"><div>"
     html += "<p class=\"eyebrow\">Reusable configurations</p><h2>Scan presets</h2>"
     html += "<p class=\"muted\">Create scan configurations and choose the preset used by the scanner's physical button.</p>"
     html += "</div><a class=\"button-link secondary-link\" href=\"/presets?edit_mode=new\">New preset</a></div>"

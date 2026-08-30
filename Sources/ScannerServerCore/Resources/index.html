@@ -338,6 +338,12 @@
         let revision = SCANNER_SERVER_REVISION;
         const hasDocumentResults = document.querySelector("[data-document-results]") !== null;
         const hasWorkersPanel = document.querySelector("[data-workers-panel]") !== null;
+        // Pages with an in-progress form (preset editor, scanner network setup) have
+        // no in-place update path, so a revision bump elsewhere on the server would
+        // otherwise trigger the generic window.location.reload() below and discard
+        // whatever the user is currently typing. Skip live updates entirely there.
+        const skipsLiveReload = document.querySelector("[data-preset-editor]") !== null
+          || document.querySelector("[data-scanner-setup]") !== null;
         const reconnect = () => window.setTimeout(waitForUpdate, 5000);
         async function waitForUpdate() {
           try {
@@ -369,7 +375,7 @@
             reconnect();
           }
         }
-        waitForUpdate();
+        if (!skipsLiveReload) waitForUpdate();
       })();
     </script>
   </body>
