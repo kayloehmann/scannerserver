@@ -216,6 +216,31 @@
           saveWorkerSettings();
         });
 
+        const replaceScanPanel = (html) => {
+          const currentPanel = document.querySelector("[data-scan-panel]");
+          if (!currentPanel) return;
+          const parsed = new DOMParser().parseFromString(html, "text/html");
+          const nextPanel = parsed.querySelector("[data-scan-panel]");
+          if (!nextPanel || currentPanel.outerHTML === nextPanel.outerHTML) return;
+
+          // Keep the live preset <select> (and its paired summary text, which shares
+          // its enclosing <label>) so an in-progress, not-yet-submitted preset choice
+          // is never discarded by a background status refresh.
+          const currentLabel = currentPanel.querySelector("[data-preset-select]")?.closest("label");
+          const nextLabel = nextPanel.querySelector("[data-preset-select]")?.closest("label");
+          if (currentLabel && nextLabel) nextLabel.replaceWith(currentLabel);
+
+          const scrollPosition = { x: window.scrollX, y: window.scrollY };
+          currentPanel.replaceWith(nextPanel);
+          window.scrollTo(scrollPosition.x, scrollPosition.y);
+        };
+
+        const refreshScanPanel = async () => {
+          const response = await fetch("/", { cache: "no-store" });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          replaceScanPanel(await response.text());
+        };
+
         const replaceWorkersPanel = (html) => {
           const currentPanel = document.querySelector("[data-workers-panel]");
           if (!currentPanel) return;
@@ -338,6 +363,7 @@
         let revision = SCANNER_SERVER_REVISION;
         const hasDocumentResults = document.querySelector("[data-document-results]") !== null;
         const hasWorkersPanel = document.querySelector("[data-workers-panel]") !== null;
+        const hasScanPanel = document.querySelector("[data-scan-panel]") !== null;
         // Pages with an in-progress form (preset editor, scanner network setup) have
         // no in-place update path, so a revision bump elsewhere on the server would
         // otherwise trigger the generic window.location.reload() below and discard
@@ -365,6 +391,10 @@
               if (pdfImportInProgress) reconnect();
               else if (hasWorkersPanel) {
                 await refreshWorkersPanel();
+                window.setTimeout(waitForUpdate, 0);
+              }
+              else if (hasScanPanel) {
+                await refreshScanPanel();
                 window.setTimeout(waitForUpdate, 0);
               }
               else window.location.reload();

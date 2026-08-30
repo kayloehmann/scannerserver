@@ -1514,6 +1514,7 @@ private func renderIndexContent(
     }
     switch page {
     case .scan:
+        html += "<div data-scan-panel>"
         if !wifiBackend || setup.configured {
             html += renderScan(settings: settings, job: job)
             html += renderStatus(job: job, ocr: ocr, localTime: localTime)
@@ -1523,6 +1524,7 @@ private func renderIndexContent(
             html += "<p class=\"muted\">Scanner discovery and connection are managed separately from everyday scanning.</p>"
             html += "<a class=\"button-link\" href=\"/settings\">Open network setup</a></section>"
         }
+        html += "</div>"
     case .documents:
         html += renderFiles(groups, settings: settings)
     case .presets:
